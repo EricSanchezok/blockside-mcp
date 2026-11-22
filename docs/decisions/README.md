@@ -73,3 +73,4 @@ The first four records describe governance choices inherited from Repo Seed.
 - [0001 Use Repo Seed as a generator skill](0001-repo-seed-is-a-skill-not-a-template.md)
 - [0002 Structure repository governance](0002-self-governing-repository-design.md)
 - [0003 Instantiate repo-review per project](0003-repo-review-instantiated-per-project.md)
+- [0004 Keep Minecraft behind a game adapter](0004-keep-minecraft-behind-a-game-adapter.md)

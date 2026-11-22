@@ -1,0 +1,5 @@
+node_modules/
+.blockside/
+.blockside-auth/
+.env
+.env.*

@@ -15,9 +15,11 @@ Name the behavior or invariant at risk before writing a test. Choose the lowest 
 
 ## Test topology
 
-The baseline's executable checks are the local governance verifiers. They check documentation links, placeholders, artifact structure, and the Repo Seed manifest. [Gate command](../AGENTS.md#commands)
+- Controller tests inject a mock game session to verify lifecycle and cancellation. [Controller tests](../tests/controller.test.mjs)
+- MCP contract tests start the real stdio process with temporary operator configurations. [MCP tests](../tests/mcp.test.mjs)
+- The protocol fixture runs on an ephemeral loopback port in offline mode. It supplies a synthetic world and observes packets from the real adapter. [Protocol tests](../tests/protocol.test.mjs)
 
-Introduce product test suites, entry commands, and fixtures alongside the first behavior that needs them. Use the risk table above to choose between unit, integration, and end-to-end evidence.
+The default suite uses no Internet game target, account credentials, Mojang server JAR, or Microsoft sign-in. Treat a separately authorized vanilla server and account check as live evidence. [Gate and test commands](../AGENTS.md#commands)
 
 Follow the ecosystem's discoverable convention rather than forcing a universal tree. Colocated unit tests are valid where idiomatic; cross-module and system tests belong in clearly named repository-level roots. Keep a fixture beside the test that owns it and promote it to shared infrastructure only when multiple contracts genuinely share it.
 

@@ -58,13 +58,13 @@ export function createMcpServer(game) {
     }))
   }))
   // The low-level tool handler keeps input errors and unknown names from echoing model-supplied values.
-  server.setRequestHandler('tools/call', async ({ params }, { signal }) => {
+  server.setRequestHandler('tools/call', async ({ params }, { mcpReq }) => {
     try {
       const tool = tools.get(params.name)
       if (!tool) throw new BlocksideError('UNKNOWN_TOOL')
       const parsed = tool.schema.safeParse(params.arguments ?? {})
       if (!parsed.success) throw new BlocksideError('INVALID_INPUT')
-      const output = await tool.run(game, parsed.data, signal)
+      const output = await tool.run(game, parsed.data, mcpReq.signal)
       return result(output)
     } catch (error) {
       const failure = safeError(error)

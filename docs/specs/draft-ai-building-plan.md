@@ -9,15 +9,16 @@ Let the ChatGPT conversation turn an owner's build request and recent game obser
 
 ## Contract
 
-- A game adapter snapshot fixes the origin and dimensions of the owner-selected build volume, up to 8 × 4 × 8 blocks. It supplies observed air, occupied and unknown cells, observed supporting faces in and directly adjacent to the volume, and counts of supported materials in inventory. The executor's material palette contains stable full blocks that supply six supporting faces and consume one item per placement.
-- The plan is a JSON object with one `placements` array of 1–64 entries. Each entry has exactly three integer offsets `x`, `y`, `z` from the snapshot origin and one `block` name from the adapter's material palette. The array specifies placement order. The plan cannot change its observation, bounds, or palette.
-- Validate the full plan against the snapshot tied to the current game session. Require a unique, in-bounds, observed air cell for each placement, an observed supporting face or one supplied by an earlier placement, and enough inventory for the total count of each material. Reject the whole candidate for invalid fields, malformed or oversized input, unavailable terrain, insufficient resources, or a stale observation.
+- The adapter gives the model an opaque `snapshotId` for the exact immutable observation it receives. The observation binds the game session, world, dimension, and owner-selected build volume, including its origin and size of up to 8 × 4 × 8 blocks. It captures air, occupied and unknown cells, supporting faces in and directly adjacent to the volume, and inventory counts for the material palette. The palette contains stable full blocks that supply six supporting faces and consume one item per placement.
+- The plan is a JSON object with exactly two fields, the `snapshotId` from the observation used for planning and a `placements` array of 1–64 entries in execution order. Each entry has exactly three integer offsets `x`, `y`, `z` from that snapshot's origin and one `block` name from its palette.
+- Resolve the submitted ID to the exact snapshot issued to the model for that site. Require a unique, in-bounds, observed air cell for each placement, an observed supporting face or one supplied by an earlier placement, and enough inventory for the total count of each material. Reject invalid input and unknown IDs before placing any blocks. A change to the session, world, dimension, volume, captured cells, support, or inventory counts invalidates the ID for starting execution, even within the same session. Loss of observation also invalidates it.
 - When the request permits a choice of site or material, the chat can choose another observed location within the volume or another material in the palette. When the stated requirements cannot be met, it reports the blocker to the owner.
 
 Three blocks of cobblestone edging in an L use this placement list.
 
 ```json
 {
+  "snapshotId": "example-snapshot",
   "placements": [
     { "x": 0, "y": 0, "z": 0, "block": "cobblestone" },
     { "x": 1, "y": 0, "z": 0, "block": "cobblestone" },
@@ -28,7 +29,9 @@ Three blocks of cobblestone edging in an L use this placement list.
 
 ## Plan
 
-Add the validator when an approved build action can consume the placement list. Keep the model in the ChatGPT conversation and run preflight at the tool boundary with observations from the game adapter. Route ordinary player placements through the same controller and adapter that own the game session, action deadline, and cancellation. The executor rechecks the live target, support, and inventory before each placement and stops on a conflict. Snapshot validation establishes fit and material cost at observation time. Reachability and placement success belong to the executor.
+Add the validator when an approved build action can consume the placement list. Keep the model in the ChatGPT conversation and run preflight at the tool boundary. Route ordinary player placements and reachability checks through the existing controller and adapter that own the session, deadline, and cancellation.
+
+Before each placement, require the same session, world, dimension, and volume. Compare live terrain, support, and inventory with the original snapshot plus the effects of confirmed placements. After sending a placement, advance only when the planned block is observed at its target and the inventory count of its item has decreased by exactly one within the action deadline. On a mismatch or missing confirmation, pause placements, invalidate the snapshot ID for execution, and report the confirmed steps and any unresolved attempt. Send each step at most once per plan. To continue after the action settles, take a fresh observation and generate a plan for the remaining work.
 
 ## Verification
 
@@ -40,9 +43,11 @@ Use synthetic snapshots and compare accepted placements and rejection reasons. T
 | On the same site with the same inventory, make three cobblestone edging blocks in an L. | Three `cobblestone` placements at `y = 0` covering a corner and one adjacent cell on each horizontal axis. |
 | Keep the cobblestone request and reduce the observed cobblestone count to two. | Report one missing cobblestone. The oak stock does not satisfy the explicit material request. |
 | Keep the oak screen request and the full inventory. A rise occupies `(1, 0, 0)`. The rows at `y = 0` and `y = 1` along `x` at `z = 1` are clear with a solid floor beneath. The owner allows any spot within the volume. | A candidate in the clear rows meets the screen geometry. The original candidate through the rise fails preflight. |
-| Mark a target in that clear row as unknown after unloading its chunk. | The candidate using that row fails preflight until the target has a fresh observation. |
+| A chunk unloads after the observation, leaving a target in the clear row unknown. | Preflight rejects the stale snapshot. A fresh observation and plan are required. |
 
-At the validator boundary, include a valid exact-cap plan, then reject 65 entries, duplicate coordinates, out-of-volume offsets, missing support, an extra `command` field, and a snapshot from a closed session. At the existing action boundary, test a world or inventory change between preflight and placement. Use an isolated synthetic fixture for those checks.
+At the validator boundary, accept an exact-cap plan and reject 65 entries, duplicate coordinates, out-of-volume offsets, missing support, an extra `command` field, and a snapshot ID from another session, world, or build volume. Within the same session, change a captured block or, in a separate case, an inventory count that still covers the plan. Each change must block the first placement.
+
+At the action boundary, change the site or inventory after a confirmed placement and verify that the next placement pauses. Drop confirmation for a placement that took effect and resubmit the plan. Check that the executor reports one unresolved attempt, rejects the old ID, and requires a fresh observation and plan that accounts for the occupied target and actual inventory.
 
 ## Evidence
 

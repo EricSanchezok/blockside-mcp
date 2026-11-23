@@ -22,7 +22,7 @@ test('connect retries once only for a transient failure before spawn', async () 
   }
 })
 
-test('a successful connection stays single and stop can cancel a bounded follow', async () => {
+test('one connection serves follow, and stop and request cancellation halt it immediately', async () => {
   let opens = 0
   let halts = 0
   let closes = 0
@@ -43,8 +43,16 @@ test('a successful connection stays single and stop can cancel a bounded follow'
   assert.equal(game.status().action, 'follow')
   assert.throws(() => game.collect({ block: 'dirt', count: 1, radius: 3 }), { code: 'BUSY' })
   assert.equal(game.stop().stopped, true)
-  await assert.rejects(pending, { code: 'CANCELED' })
   assert.equal(halts, 1)
+  assert.equal(game.stop().stopped, false)
+  await assert.rejects(pending, { code: 'CANCELED' })
+
+  const request = new AbortController()
+  const interrupted = game.follow({ player: 'Guide', seconds: 30 }, request.signal)
+  request.abort()
+  assert.equal(halts, 2)
+  await assert.rejects(interrupted, { code: 'CANCELED' })
+
   assert.equal(closes, 0)
   assert.deepEqual(game.status(), { connection: 'connected', action: null, stopping: false })
   assert.equal(game.disconnect().connection, 'disconnected')

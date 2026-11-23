@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import minecraftData from 'minecraft-data'
 import protocol from 'minecraft-protocol'
 import createChunk from 'prismarine-chunk'
@@ -15,6 +16,11 @@ const { Vec3 } = vec3
 const dirt = { x: 4, y: 64, z: 2 }
 const spawn = { x: 2.5, y: 64, z: 2.5 }
 const guideId = '00000000-0000-4000-8000-000000000011'
+const guideEntityId = 10
+const guideInfo = {
+  action: { add_player: true },
+  data: [{ uuid: guideId, player: { name: 'Guide', properties: [] } }]
+}
 const dropId = '00000000-0000-4000-8000-000000000012'
 
 function spawnEntity(client, entityId, uuid, type, position) {
@@ -25,6 +31,12 @@ function spawnEntity(client, entityId, uuid, type, position) {
   })
 }
 
+function guidePosition(x) {
+  return {
+    entityId: guideEntityId, x, y: 64, z: 2.5, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, onGround: true
+  }
+}
+
 async function loopback(t, { guide = false, pickup } = {}) {
   const server = protocol.createServer({
     host: '127.0.0.1', port: 0, version: javaVersion, 'online-mode': false, hideErrors: true
@@ -33,6 +45,9 @@ async function loopback(t, { guide = false, pickup } = {}) {
   const movements = []
   const digs = []
   const digging = Promise.withResolvers()
+  const walking = Promise.withResolvers()
+  let connectedClient
+  let joins = 0
   let dropPosition
   let pickupSent = false
   let playerLoaded = false
@@ -44,17 +59,16 @@ async function loopback(t, { guide = false, pickup } = {}) {
   if (pickup) chunk.setBlockStateId(new Vec3(dirt.x, dirt.y, dirt.z), data.blocksByName.dirt.defaultState)
 
   server.on('playerJoin', client => {
+    connectedClient = client
+    joins++
     client.on('player_loaded', () => { playerLoaded = true })
     client.write('login', { ...data.loginPacket, entityId: client.id })
     client.write('map_chunk', {
       x: 0, z: 0, heightmaps: [], chunkData: chunk.dump(), blockEntities: [], ...chunk.dumpLight()
     })
     if (guide) {
-      client.write('player_info', {
-        action: { add_player: true },
-        data: [{ uuid: guideId, player: { name: 'Guide', properties: [] } }]
-      })
-      spawnEntity(client, 10, guideId, 'player', { x: 7.5, y: 64, z: 2.5 })
+      client.write('player_info', guideInfo)
+      spawnEntity(client, guideEntityId, guideId, 'player', { x: 7.5, y: 64, z: 2.5 })
     }
     client.write('position', { ...spawn, teleportId: 1, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: {} })
     client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
@@ -65,6 +79,7 @@ async function loopback(t, { guide = false, pickup } = {}) {
     }
     const onMovement = position => {
       movements.push(position.x)
+      if (position.x > spawn.x + 0.5) walking.resolve(position.x)
       if (!dropPosition || pickupSent || Math.hypot(position.x - dropPosition.x, position.z - dropPosition.z) > 0.9) return
       pickupSent = true
       client.write('collect', { collectedEntityId: 11, collectorEntityId: client.id, pickupItemCount: 1 })
@@ -97,18 +112,98 @@ async function loopback(t, { guide = false, pickup } = {}) {
     server.close()
     await closed
   })
-  return { game, movements, digs, digging: digging.promise, loaded: () => playerLoaded, sentPickup: () => pickupSent }
+  return {
+    game, movements, digs, digging: digging.promise, walking: walking.promise,
+    get client() { return connectedClient },
+    get joins() { return joins },
+    loaded: () => playerLoaded,
+    sentPickup: () => pickupSent
+  }
 }
 
-test('Java 1.21.11 loopback spawn, follow movement and disconnect', { timeout: 10_000 }, async t => {
+test('Java 1.21.11 loopback follows a moving guide and completes at the requested time', { timeout: 10_000 }, async t => {
   const fixture = await loopback(t, { guide: true })
   const { game } = fixture
   assert.equal((await game.connect()).connection, 'connected')
-  assert.deepEqual(await game.follow({ player: 'Guide', seconds: 2 }), { followed: true, seconds: 2 })
+  const followed = game.follow({ player: 'Guide', seconds: 3 })
+  await fixture.walking
+  fixture.client.write('sync_entity_position', guidePosition(10.5))
+  assert.deepEqual(await followed, { followed: true, seconds: 3 })
   assert.equal(fixture.loaded(), true)
-  assert.ok(fixture.movements.some(x => x > spawn.x + 1))
+  assert.ok(fixture.movements.some(x => x > 7))
   assert.equal(fixture.digs.length, 0)
   assert.equal(game.disconnect().connection, 'disconnected')
+})
+
+test('Java 1.21.11 loopback manual stop cancels movement and follow stays idle', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { guide: true })
+  const { game } = fixture
+  await game.connect()
+  const canceled = assert.rejects(game.follow({ player: 'Guide', seconds: 5 }), { code: 'CANCELED' })
+  await fixture.walking
+  const stoppedAt = fixture.movements.at(-1)
+  assert.deepEqual(game.stop(), { stopped: true, connection: 'connected', action: 'follow', stopping: true })
+  await canceled
+
+  fixture.client.write('sync_entity_position', guidePosition(12.5))
+  await delay(750)
+  assert.ok(fixture.movements.every(x => x < stoppedAt + 0.75))
+  assert.deepEqual(game.status(), { connection: 'connected', action: null, stopping: false })
+})
+
+test('Java 1.21.11 loopback follow ends when the guide leaves and returns in one bundle', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { guide: true })
+  const { game } = fixture
+  await game.connect()
+  await assert.rejects(game.follow({ player: 'Missing', seconds: 2 }), { code: 'PLAYER_UNAVAILABLE' })
+
+  const unavailable = assert.rejects(game.follow({ player: 'Guide', seconds: 2 }), { code: 'PLAYER_UNAVAILABLE' })
+  await fixture.walking
+  fixture.client.writeBundle([
+    ['player_remove', { players: [guideId] }],
+    ['player_info', guideInfo],
+    ['sync_entity_position', guidePosition(12.5)]
+  ])
+  await unavailable
+  const stoppedAt = fixture.movements.at(-1)
+  await delay(750)
+  assert.ok(fixture.movements.every(x => x < stoppedAt + 0.75))
+  assert.deepEqual(game.status(), { connection: 'connected', action: null, stopping: false })
+})
+
+test('Java 1.21.11 loopback follow ends when the guide crosses the leash', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { guide: true })
+  const { game } = fixture
+  await game.connect()
+  const outOfRange = assert.rejects(game.follow({ player: 'Guide', seconds: 2 }), { code: 'OUT_OF_RANGE' })
+  await fixture.walking
+  fixture.client.writeBundle([
+    ['sync_entity_position', guidePosition(19.5)],
+    ['sync_entity_position', guidePosition(12.5)]
+  ])
+  await outOfRange
+  assert.equal(game.status().action, null)
+})
+
+test('Java 1.21.11 loopback disconnect interrupts follow without reconnecting or replaying', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { guide: true })
+  const { game } = fixture
+  await game.connect()
+  const interrupted = assert.rejects(game.follow({ player: 'Guide', seconds: 5 }), { code: 'DISCONNECTED' })
+  await fixture.walking
+  fixture.client.socket.destroy()
+  await interrupted
+
+  await delay(250)
+  assert.equal(fixture.joins, 1)
+  assert.deepEqual(game.status(), { connection: 'disconnected', action: null, stopping: false })
+  const beforeReconnect = fixture.movements.length
+  await game.connect()
+  await delay(750)
+  assert.equal(fixture.joins, 2)
+  assert.ok(fixture.movements.length > beforeReconnect)
+  assert.ok(fixture.movements.slice(beforeReconnect).every(x => x === spawn.x))
+  assert.deepEqual(game.status(), { connection: 'connected', action: null, stopping: false })
 })
 
 test('Java 1.21.11 loopback collection confirms the pickup and reports a partial count', { timeout: 10_000 }, async t => {

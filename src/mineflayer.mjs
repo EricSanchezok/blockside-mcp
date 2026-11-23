@@ -129,31 +129,44 @@ class MineflayerSession {
   }
 
   async follow({ player, seconds }, requestSignal) {
-    const entity = this.#bot.players[player]?.entity
-    if (!entity?.isValid || entity === this.#bot.entity) throw new BlocksideError('PLAYER_UNAVAILABLE')
+    const bot = this.#bot
+    const entity = bot.players[player]?.entity
+    if (!entity?.isValid || entity === bot.entity) throw new BlocksideError('PLAYER_UNAVAILABLE')
 
     return this.#navigate(followRadius, requestSignal, async ({ origin, signal, guard }) => {
-      const keepPlayerInRange = () => {
-        if (!entity.isValid || this.#bot.players[player]?.entity !== entity) {
-          guard.abort(new BlocksideError('PLAYER_UNAVAILABLE'))
-        } else if (!within(entity.position, origin, followRadius)) {
+      const checkPosition = moved => {
+        if (moved === entity && !within(moved.position, origin, followRadius)) {
           guard.abort(new BlocksideError('OUT_OF_RANGE'))
         }
+      }
+      const unavailable = () => guard.abort(new BlocksideError('PLAYER_UNAVAILABLE'))
+      const onEntityGone = gone => {
+        if (gone === entity) unavailable()
+      }
+      const onPlayerLeft = ({ username }) => {
+        if (username === player) unavailable()
       }
       const checkPath = ({ status }) => {
         if (status === 'noPath' || status === 'timeout') guard.abort(new BlocksideError('UNREACHABLE'))
       }
-      keepPlayerInRange()
+      checkPosition(entity)
       signal.throwIfAborted()
-      this.#bot.on('physicsTick', keepPlayerInRange)
-      this.#bot.on('path_update', checkPath)
+      bot.on('entityMoved', checkPosition)
+      bot.on('entityGone', onEntityGone)
+      bot.on('playerLeft', onPlayerLeft)
+      bot.on('path_update', checkPath)
       try {
-        this.#bot.pathfinder.setGoal(new goals.GoalFollow(entity, 2), true)
-        await delay(seconds * 1000, undefined, { signal }).catch(() => signal.throwIfAborted())
+        bot.pathfinder.setGoal(new goals.GoalFollow(entity, 2), true)
+        await delay(seconds * 1000, undefined, { signal })
         return { followed: true, seconds }
+      } catch (error) {
+        signal.throwIfAborted()
+        throw error
       } finally {
-        this.#bot.off('physicsTick', keepPlayerInRange)
-        this.#bot.off('path_update', checkPath)
+        bot.off('entityMoved', checkPosition)
+        bot.off('entityGone', onEntityGone)
+        bot.off('playerLeft', onPlayerLeft)
+        bot.off('path_update', checkPath)
       }
     })
   }

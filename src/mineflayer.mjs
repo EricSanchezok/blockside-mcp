@@ -59,6 +59,90 @@ function observeRemoval(bot, position) {
   }
 }
 
+function droppedItem(entity) {
+  try {
+    return entity.getDroppedItem?.()
+  } catch {
+    return undefined
+  }
+}
+
+function observePickup(bot, position, itemType, origin, radius) {
+  const removal = observeRemoval(bot, position)
+  const previous = new Set(Object.values(bot.entities))
+  const spawnedBeforeRemoval = new Map()
+  const unidentified = new Set()
+  const conflict = new AbortController()
+  const before = bot.inventory.count(itemType)
+  const blockCenter = center(position)
+  let candidate
+  let pursued
+  let pickedUp = false
+
+  const ambiguous = () => conflict.abort(new BlocksideError('PICKUP_AMBIGUOUS'))
+  const onSpawn = entity => {
+    if (entity.name !== 'item' || previous.has(entity) || spawnedBeforeRemoval.has(entity) ||
+        !within(entity.position, blockCenter, 0.75) || !within(entity.position, origin, radius)) return
+    spawnedBeforeRemoval.set(entity, !removal.confirmed)
+    unidentified.add(entity)
+  }
+  const onDrop = entity => {
+    if (!spawnedBeforeRemoval.has(entity)) return
+    const item = droppedItem(entity)
+    if (!item) return
+    unidentified.delete(entity)
+    if (item.type !== itemType) {
+      if (candidate === entity) ambiguous()
+      return
+    }
+    if (item.count !== 1 || (candidate && candidate !== entity)) ambiguous()
+    else candidate = entity
+  }
+  const onPickup = (collector, entity) => {
+    if (collector !== bot.entity || (pickedUp && entity === candidate)) return
+    const item = droppedItem(entity)
+    if (entity !== candidate) {
+      if (item?.type === itemType || unidentified.has(entity)) ambiguous()
+      return
+    }
+    // A passive pickup of an early item cannot be linked by packet order alone.
+    if (!removal.confirmed || (spawnedBeforeRemoval.get(entity) && pursued !== entity) ||
+        item?.type !== itemType || item.count !== 1 || bot.entities[entity.id] !== entity ||
+        bot.inventory.count(itemType) !== before) {
+      ambiguous()
+      return
+    }
+    pickedUp = true
+  }
+  bot.on('entitySpawn', onSpawn)
+  bot.on('itemDrop', onDrop)
+  bot.on('playerCollect', onPickup)
+  return {
+    signal: conflict.signal,
+    get pickedUp() { return pickedUp },
+    ready() {
+      if (!removal.confirmed || unidentified.size > 0) return undefined
+      if (pickedUp) return candidate
+      if (candidate?.isValid && bot.entities[candidate.id] === candidate &&
+          within(candidate.position, origin, radius)) return candidate
+    },
+    pursue(entity) { pursued = entity },
+    confirmed() {
+      return !conflict.signal.aborted && unidentified.size === 0 && pickedUp && bot.inventory.count(itemType) - before === 1
+    },
+    failure() {
+      const unresolved = unidentified.size > 0 || bot.inventory.count(itemType) !== before
+      return new BlocksideError(unresolved ? 'PICKUP_AMBIGUOUS' : 'NO_PICKUP')
+    },
+    detach() {
+      removal.detach()
+      bot.off('entitySpawn', onSpawn)
+      bot.off('itemDrop', onDrop)
+      bot.off('playerCollect', onPickup)
+    }
+  }
+}
+
 export function mineflayerFactory(config) {
   return onLost => {
     if (config.auth === 'microsoft') checkAuthCache(config.profilesFolder)
@@ -264,56 +348,36 @@ class MineflayerSession {
       throw new BlocksideError('UNREACHABLE')
     }
 
-    const removal = observeRemoval(bot, position)
-    const spawned = new Set()
-    const drops = new Set()
-    const before = bot.inventory.count(itemType)
-    const blockCenter = center(position)
-    let pickedUp = false
-    const nearTarget = entity => within(entity.position, blockCenter, 0.75) && within(entity.position, origin, radius)
-    const onSpawn = entity => {
-      if (removal.confirmed && entity.name === 'item' && nearTarget(entity)) spawned.add(entity)
-    }
-    const onDrop = entity => {
-      // Item metadata can arrive after the removal for an entity that spawned earlier.
-      if (spawned.has(entity) && nearTarget(entity) && entity.getDroppedItem()?.type === itemType) drops.add(entity)
-    }
-    const onPickup = (collector, entity) => {
-      if (collector.id === bot.entity.id && drops.has(entity)) pickedUp = true
-    }
-    const hasConfirmedPickup = () => pickedUp && bot.inventory.count(itemType) > before
+    const pickup = observePickup(bot, position, itemType, origin, radius)
+    const work = AbortSignal.any([signal, pickup.signal])
+    let pursuing = false
     let confirmedAtCancel = false
-    const onAbort = () => { confirmedAtCancel = hasConfirmedPickup() }
-    bot.on('entitySpawn', onSpawn)
-    bot.on('itemDrop', onDrop)
-    bot.on('playerCollect', onPickup)
+    const onAbort = () => { confirmedAtCancel = pickup.confirmed() }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
       // Navigate with digging disabled. Only this explicit call breaks a block.
-      await abortable(bot.dig(block), signal)
-      const drop = await until(() => pickedUp || [...drops].find(entity => entity.isValid), signal, 1000)
-      if (!drop) throw new BlocksideError('NO_PICKUP')
-      signal.throwIfAborted()
-      if (!pickedUp) {
+      await abortable(bot.dig(block), work)
+      const drop = await until(pickup.ready, work, 1000)
+      if (!drop) throw pickup.failure()
+      work.throwIfAborted()
+      if (!pickup.pickedUp) {
+        pickup.pursue(drop)
+        pursuing = true
         bot.collectBlock.movements = movements
         try {
-          await abortable(bot.collectBlock.collect(drop, { chestLocations: [] }), signal)
-        } catch (error) {
-          signal.throwIfAborted()
-          if (!pickedUp) throw safeError(error, 'NO_PICKUP')
+          await abortable(bot.collectBlock.collect(drop, { chestLocations: [] }), work)
+        } catch {
+          work.throwIfAborted()
+          if (!pickup.pickedUp) throw pickup.failure()
         }
       }
-      if (!await until(hasConfirmedPickup, signal, 1000)) {
-        throw new BlocksideError('NO_PICKUP')
-      }
-      signal.throwIfAborted()
+      if (!await until(pickup.confirmed, work, 1000)) throw pickup.failure()
+      work.throwIfAborted()
     } finally {
       signal.removeEventListener('abort', onAbort)
-      removal.detach()
-      bot.off('entitySpawn', onSpawn)
-      bot.off('itemDrop', onDrop)
-      bot.off('playerCollect', onPickup)
-      if (signal.aborted ? confirmedAtCancel : hasConfirmedPickup()) recordPickup()
+      pickup.detach()
+      if (signal.aborted ? confirmedAtCancel : pickup.confirmed()) recordPickup()
+      if (pursuing && pickup.signal.aborted && !signal.aborted) this.close()
     }
   }
 }

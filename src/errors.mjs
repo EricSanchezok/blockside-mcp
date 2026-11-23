@@ -14,6 +14,7 @@ const messages = {
   NO_BLOCK: 'No matching loaded block is within reach of the action area.',
   NO_PICKUP: 'The game did not confirm a matching pickup.',
   OUT_OF_RANGE: 'The action reached its movement limit.',
+  PICKUP_AMBIGUOUS: 'The game observations could not establish a unique pickup for the selected block.',
   PLAYER_UNAVAILABLE: 'The player is outside the bot’s view.',
   TRANSIENT_CONNECT: 'The game connection closed before spawn.',
   UNKNOWN_TOOL: 'The tool is unavailable.',

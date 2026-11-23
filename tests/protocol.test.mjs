@@ -17,6 +17,7 @@ const dirt = { x: 4, y: 64, z: 2 }
 const spawn = { x: 2.5, y: 64, z: 2.5 }
 const guideId = '00000000-0000-4000-8000-000000000011'
 const dropId = '00000000-0000-4000-8000-000000000012'
+const competingDropId = '00000000-0000-4000-8000-000000000013'
 const pickupFence = 926_582_309_446n
 
 function spawnEntity(client, entityId, uuid, type, position) {
@@ -27,7 +28,7 @@ function spawnEntity(client, entityId, uuid, type, position) {
   })
 }
 
-async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}) {
+async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawnBeforeRemoval = false } = {}) {
   const server = protocol.createServer({
     host: '127.0.0.1', port: 0, version: javaVersion, 'online-mode': false, hideErrors: true
   })
@@ -67,15 +68,23 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
       itemCount: 1, itemId: data.itemsByName.dirt.id,
       addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: []
     }
-    const sendPickup = () => {
+    const announceItem = entityId => client.write('entity_metadata', {
+      entityId,
+      metadata: [{ key: data.supportFeature('metadataIxOfItem'), type: 'item_stack', value: item }]
+    })
+    const announceCompetingDrop = () => {
+      spawnEntity(client, 12, competingDropId, 'item', { ...dropPosition, z: dropPosition.z + 0.15 })
+      announceItem(12)
+    }
+    const sendPickup = (entityId = 11) => {
       pickupSent = true
-      client.write('collect', { collectedEntityId: 11, collectorEntityId: client.id, pickupItemCount: 1 })
+      client.write('collect', { collectedEntityId: entityId, collectorEntityId: client.id, pickupItemCount: 1 })
       if (pickup !== 'unconfirmed') client.write('set_player_inventory', { slotId: 0, contents: item })
       if (pickup === 'pending') {
         // The reply proves the bot processed the collect and inventory packets in order.
         client.write('keep_alive', { keepAliveId: pickupFence })
       } else {
-        client.write('entity_destroy', { entityIds: [11] })
+        client.write('entity_destroy', { entityIds: [entityId] })
       }
     }
     client.on('keep_alive', ({ keepAliveId }) => {
@@ -84,8 +93,13 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
     const onMovement = position => {
       movements.push(position.x)
       if (guide && position.x > spawn.x + 0.25) following.resolve()
-      if (!dropPosition || pickupSent || Math.hypot(position.x - dropPosition.x, position.z - dropPosition.z) > 0.9) return
-      sendPickup()
+      if (!dropPosition || pickupSent) return
+      if (pickup === 'competing-during-pursuit' && position.x > spawn.x + 0.35) {
+        announceCompetingDrop()
+        sendPickup(12)
+      } else if (Math.hypot(position.x - dropPosition.x, position.z - dropPosition.z) <= 0.9) {
+        sendPickup()
+      }
     }
     client.on('position', onMovement)
     client.on('position_look', onMovement)
@@ -94,8 +108,8 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
       if (status === 0) digging.resolve(location)
       if (status !== 2 || !pickup) return
       dropPosition = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
-      const spawnDrop = () => spawnEntity(client, 11, dropId, 'item', dropPosition)
-      if (pickup === 'unrelated') spawnDrop()
+      if (spawnBeforeRemoval || pickup === 'unrelated') spawnEntity(client, 11, dropId, 'item', dropPosition)
+      if (spawnBeforeRemoval) announceItem(11)
       const air = data.blocksByName.air.defaultState
       if (sectionUpdate) {
         const record = (air << 12) | (dirt.x << 8) | (dirt.z << 4) | (dirt.y & 15)
@@ -103,12 +117,15 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
       } else {
         client.write('block_change', { location: dirt, type: air })
       }
-      if (pickup !== 'unrelated') spawnDrop()
-      client.write('entity_metadata', {
-        entityId: 11,
-        metadata: [{ key: data.supportFeature('metadataIxOfItem'), type: 'item_stack', value: item }]
-      })
+      if (!spawnBeforeRemoval) {
+        if (pickup !== 'unrelated') spawnEntity(client, 11, dropId, 'item', dropPosition)
+        announceItem(11)
+      }
       if (pickup === 'unrelated') sendPickup()
+      if (pickup === 'competing') {
+        announceCompetingDrop()
+        sendPickup(12)
+      }
     })
   })
 
@@ -170,14 +187,17 @@ test('Java 1.21.11 loopback collection confirms the pickup and reports a partial
   assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
 })
 
-test('Java 1.21.11 loopback collection returns a receipt for a completed pickup', { timeout: 10_000 }, async t => {
-  const fixture = await loopback(t, { pickup: 'confirmed' })
-  await fixture.game.connect()
-  assert.deepEqual(await fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), {
-    block: 'dirt', requested: 1, collected: 1
+for (const spawnBeforeRemoval of [false, true]) {
+  const order = spawnBeforeRemoval ? 'before' : 'after'
+  test(`Java 1.21.11 loopback confirms a targeted pickup when the item spawns ${order} removal`, { timeout: 10_000 }, async t => {
+    const fixture = await loopback(t, { pickup: 'confirmed', spawnBeforeRemoval })
+    await fixture.game.connect()
+    assert.deepEqual(await fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), {
+      block: 'dirt', requested: 1, collected: 1
+    })
+    assert.equal(fixture.sentPickup(), true)
   })
-  assert.equal(fixture.sentPickup(), true)
-})
+}
 
 test('Java 1.21.11 loopback item disappearance without inventory gain gives no receipt', { timeout: 10_000 }, async t => {
   const fixture = await loopback(t, { pickup: 'unconfirmed' })
@@ -190,15 +210,40 @@ test('Java 1.21.11 loopback item disappearance without inventory gain gives no r
   assert.equal(fixture.sentPickup(), true)
 })
 
-test('Java 1.21.11 loopback collection rejects a same-type drop spawned before the block broke', { timeout: 10_000 }, async t => {
+test('Java 1.21.11 loopback leaves a prematurely collected early drop ambiguous', { timeout: 10_000 }, async t => {
   const fixture = await loopback(t, { pickup: 'unrelated' })
   await fixture.game.connect()
   await assert.rejects(fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), error => {
-    assert.equal(error.code, 'NO_PICKUP')
+    assert.equal(error.code, 'PICKUP_AMBIGUOUS')
     assert.deepEqual(error.receipt, { block: 'dirt', requested: 1, collected: 0 })
     return true
   })
   assert.equal(fixture.sentPickup(), true)
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+})
+
+test('Java 1.21.11 loopback leaves a competing same-type pickup ambiguous', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { pickup: 'competing' })
+  await fixture.game.connect()
+  await assert.rejects(fixture.game.collect({ block: 'dirt', count: 2, radius: 5 }), error => {
+    assert.equal(error.code, 'PICKUP_AMBIGUOUS')
+    assert.deepEqual(error.receipt, { block: 'dirt', requested: 2, collected: 0 })
+    return true
+  })
+  assert.equal(fixture.sentPickup(), true)
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+})
+
+test('Java 1.21.11 loopback stops a pursuit when a competing item appears', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { pickup: 'competing-during-pursuit' })
+  await fixture.game.connect()
+  await assert.rejects(fixture.game.collect({ block: 'dirt', count: 2, radius: 5 }), error => {
+    assert.equal(error.code, 'PICKUP_AMBIGUOUS')
+    assert.equal(error.receipt.collected, 0)
+    return true
+  })
+  assert.equal(fixture.sentPickup(), true)
+  assert.equal(fixture.game.status().connection, 'disconnected')
   assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
 })
 

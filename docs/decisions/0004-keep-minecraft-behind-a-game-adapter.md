@@ -24,7 +24,7 @@ Blockside has to map a small model-facing contract onto game actions whose progr
 
 ## Decision Outcome
 
-The MCP layer delegates to the controller, which owns the single active action and connection lifecycle. The adapter owns the fixed game endpoint, Mineflayer lifecycle, navigation, and pickup observations. Package and protocol versions are pinned in the project manifest and lockfile.
+The MCP layer delegates to the controller, which owns the single active action and connection lifecycle. The adapter owns the fixed game endpoint, Mineflayer lifecycle, navigation, and pickup observations. The lockfile pins the game packages. The operator selects an exact supported protocol in the private configuration before the runner starts.
 
 ## Pros and Cons of the Options
 

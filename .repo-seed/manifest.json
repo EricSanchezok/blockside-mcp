@@ -56,13 +56,13 @@
     },
     {
       "path": "docs/architecture.md",
-      "sha256": "7f3af1cc322ad61da6aec88bdf4fa04a9240bc57b96a38cfa1d7f778f3dd3c3f",
+      "sha256": "8265dcab2375a0078a406c08d1d37a6d66e60a4607bacb753ef030c52c04fe54",
       "category": "docs",
       "capability": "baseline"
     },
     {
       "path": "docs/development.md",
-      "sha256": "8da0feca27aff1c988f21270eb7febec8e94f3384d9031e2bdb66ad5f6379685",
+      "sha256": "3495fa2b7ff12e3129d89860901f3daf4b7a0c35dcbd3fe67c86d9644220b478",
       "category": "docs",
       "capability": "baseline"
     },

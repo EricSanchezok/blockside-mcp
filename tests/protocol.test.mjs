@@ -8,6 +8,7 @@ import vec3 from 'vec3'
 import { javaVersion } from '../src/config.mjs'
 import { GameController } from '../src/controller.mjs'
 import { mineflayerFactory } from '../src/mineflayer.mjs'
+import { startStdio } from './stdio-fixture.mjs'
 
 const data = minecraftData(javaVersion)
 const Chunk = createChunk(javaVersion)
@@ -16,6 +17,7 @@ const dirt = { x: 4, y: 64, z: 2 }
 const spawn = { x: 2.5, y: 64, z: 2.5 }
 const guideId = '00000000-0000-4000-8000-000000000011'
 const dropId = '00000000-0000-4000-8000-000000000012'
+const pickupFence = 926_582_309_446n
 
 function spawnEntity(client, entityId, uuid, type, position) {
   client.write('spawn_entity', {
@@ -25,7 +27,7 @@ function spawnEntity(client, entityId, uuid, type, position) {
   })
 }
 
-async function loopback(t, { guide = false, pickup } = {}) {
+async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}) {
   const server = protocol.createServer({
     host: '127.0.0.1', port: 0, version: javaVersion, 'online-mode': false, hideErrors: true
   })
@@ -33,6 +35,8 @@ async function loopback(t, { guide = false, pickup } = {}) {
   const movements = []
   const digs = []
   const digging = Promise.withResolvers()
+  const following = Promise.withResolvers()
+  const pickupProcessed = Promise.withResolvers()
   let dropPosition
   let pickupSent = false
   let playerLoaded = false
@@ -63,13 +67,25 @@ async function loopback(t, { guide = false, pickup } = {}) {
       itemCount: 1, itemId: data.itemsByName.dirt.id,
       addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: []
     }
-    const onMovement = position => {
-      movements.push(position.x)
-      if (!dropPosition || pickupSent || Math.hypot(position.x - dropPosition.x, position.z - dropPosition.z) > 0.9) return
+    const sendPickup = () => {
       pickupSent = true
       client.write('collect', { collectedEntityId: 11, collectorEntityId: client.id, pickupItemCount: 1 })
-      if (pickup === 'confirmed') client.write('set_player_inventory', { slotId: 0, contents: item })
-      client.write('entity_destroy', { entityIds: [11] })
+      if (pickup !== 'unconfirmed') client.write('set_player_inventory', { slotId: 0, contents: item })
+      if (pickup === 'pending') {
+        // The reply proves the bot processed the collect and inventory packets in order.
+        client.write('keep_alive', { keepAliveId: pickupFence })
+      } else {
+        client.write('entity_destroy', { entityIds: [11] })
+      }
+    }
+    client.on('keep_alive', ({ keepAliveId }) => {
+      if (BigInt(keepAliveId) === pickupFence) pickupProcessed.resolve()
+    })
+    const onMovement = position => {
+      movements.push(position.x)
+      if (guide && position.x > spawn.x + 0.25) following.resolve()
+      if (!dropPosition || pickupSent || Math.hypot(position.x - dropPosition.x, position.z - dropPosition.z) > 0.9) return
+      sendPickup()
     }
     client.on('position', onMovement)
     client.on('position_look', onMovement)
@@ -77,27 +93,41 @@ async function loopback(t, { guide = false, pickup } = {}) {
       digs.push({ status, location })
       if (status === 0) digging.resolve(location)
       if (status !== 2 || !pickup) return
-      client.write('block_change', { location: dirt, type: data.blocksByName.air.defaultState })
       dropPosition = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
-      spawnEntity(client, 11, dropId, 'item', dropPosition)
+      const spawnDrop = () => spawnEntity(client, 11, dropId, 'item', dropPosition)
+      if (pickup === 'unrelated') spawnDrop()
+      const air = data.blocksByName.air.defaultState
+      if (sectionUpdate) {
+        const record = (air << 12) | (dirt.x << 8) | (dirt.z << 4) | (dirt.y & 15)
+        client.write('multi_block_change', { chunkCoordinates: { x: 0, y: 4, z: 0 }, records: [record] })
+      } else {
+        client.write('block_change', { location: dirt, type: air })
+      }
+      if (pickup !== 'unrelated') spawnDrop()
       client.write('entity_metadata', {
         entityId: 11,
         metadata: [{ key: data.supportFeature('metadataIxOfItem'), type: 'item_stack', value: item }]
       })
+      if (pickup === 'unrelated') sendPickup()
     })
   })
 
   await once(server, 'listening')
   const host = '127.0.0.1'
   const port = server.socketServer.address().port
-  const game = new GameController(mineflayerFactory({ host, port, auth: 'offline', profile: 'FixtureBot' }))
+  const config = { host, port, auth: 'offline', profile: 'FixtureBot' }
+  const game = new GameController(mineflayerFactory(config))
   t.after(async () => {
     game.disconnect()
     const closed = once(server, 'close')
     server.close()
     await closed
   })
-  return { game, movements, digs, digging: digging.promise, loaded: () => playerLoaded, sentPickup: () => pickupSent }
+  return {
+    config, game, movements, digs, digging: digging.promise, following: following.promise,
+    pickupProcessed: pickupProcessed.promise,
+    loaded: () => playerLoaded, sentPickup: () => pickupSent
+  }
 }
 
 test('Java 1.21.11 loopback spawn, follow movement and disconnect', { timeout: 10_000 }, async t => {
@@ -111,8 +141,25 @@ test('Java 1.21.11 loopback spawn, follow movement and disconnect', { timeout: 1
   assert.equal(game.disconnect().connection, 'disconnected')
 })
 
+test('the shipped stdio runner stops an active follow when the MCP client cancels', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { guide: true })
+  const { client } = await startStdio(t, fixture.config)
+  assert.equal((await client.callTool({ name: 'connect' })).structuredContent.connection, 'connected')
+  const abort = new AbortController()
+  const follow = client.callTool({ name: 'follow', arguments: { player: 'Guide', seconds: 20 } }, { signal: abort.signal })
+  const canceled = assert.rejects(follow, /Fixture canceled follow/)
+  await fixture.following
+  assert.equal((await client.callTool({ name: 'status' })).structuredContent.action, 'follow')
+  abort.abort(new Error('Fixture canceled follow'))
+  await canceled
+  assert.deepEqual((await client.callTool({ name: 'status' })).structuredContent, {
+    connection: 'connected', action: null, stopping: false
+  })
+  assert.equal((await client.callTool({ name: 'disconnect' })).structuredContent.connection, 'disconnected')
+})
+
 test('Java 1.21.11 loopback collection confirms the pickup and reports a partial count', { timeout: 10_000 }, async t => {
-  const fixture = await loopback(t, { pickup: 'confirmed' })
+  const fixture = await loopback(t, { pickup: 'confirmed', sectionUpdate: true })
   await fixture.game.connect()
   await assert.rejects(fixture.game.collect({ block: 'dirt', count: 2, radius: 5 }), error => {
     assert.equal(error.code, 'NO_BLOCK')
@@ -141,6 +188,34 @@ test('Java 1.21.11 loopback item disappearance without inventory gain gives no r
     return true
   })
   assert.equal(fixture.sentPickup(), true)
+})
+
+test('Java 1.21.11 loopback collection rejects a same-type drop spawned before the block broke', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { pickup: 'unrelated' })
+  await fixture.game.connect()
+  await assert.rejects(fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), error => {
+    assert.equal(error.code, 'NO_PICKUP')
+    assert.deepEqual(error.receipt, { block: 'dirt', requested: 1, collected: 0 })
+    return true
+  })
+  assert.equal(fixture.sentPickup(), true)
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+})
+
+test('Java 1.21.11 loopback stop preserves a confirmed pickup while collection is pending', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { pickup: 'pending' })
+  await fixture.game.connect()
+  const pending = fixture.game.collect({ block: 'dirt', count: 2, radius: 5 })
+  const stopped = assert.rejects(pending, error => {
+    assert.equal(error.code, 'CANCELED')
+    assert.deepEqual(error.receipt, { block: 'dirt', requested: 2, collected: 1 })
+    return true
+  })
+  await fixture.pickupProcessed
+  assert.equal(fixture.game.status().action, 'collect')
+  assert.equal(fixture.game.stop().connection, 'disconnected')
+  await stopped
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
 })
 
 test('Java 1.21.11 loopback stop closes the session during a dig', { timeout: 10_000 }, async t => {

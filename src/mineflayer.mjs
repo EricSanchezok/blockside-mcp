@@ -10,6 +10,7 @@ import { abortable, BlocksideError, safeError } from './errors.mjs'
 const { Movements, goals, pathfinder } = pathfinderPlugin
 const followRadius = 16
 const transientErrors = new Set(['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE'])
+const airBlocks = new Set(['air', 'cave_air', 'void_air'])
 
 function center(position) {
   return position.offset(0.5, 0.5, 0.5)
@@ -26,6 +27,35 @@ async function until(observe, signal, milliseconds) {
     const result = observe()
     if (result || performance.now() >= deadline) return result
     await delay(25, undefined, { signal }).catch(() => signal.throwIfAborted())
+  }
+}
+
+function observeRemoval(bot, position) {
+  let confirmed = false
+  const confirmAir = stateId => {
+    if (airBlocks.has(bot.registry.blocksByStateId[stateId]?.name)) confirmed = true
+  }
+  const onBlockChange = ({ location, type }) => {
+    if (position.equals(location)) confirmAir(type)
+  }
+  const onSectionChange = ({ chunkCoordinates, records }) => {
+    if (chunkCoordinates.x !== (position.x >> 4) || chunkCoordinates.y !== (position.y >> 4) ||
+        chunkCoordinates.z !== (position.z >> 4)) return
+    // A section record stores local x, z and y in its low 12 bits.
+    const local = ((position.x & 15) << 8) | ((position.z & 15) << 4) | (position.y & 15)
+    const record = records.find(value => (value & 4095) === local)
+    if (record !== undefined) confirmAir(record >> 12)
+  }
+  // Mineflayer can predict air at the end of a dig. Require a server update.
+  const client = bot._client
+  client.on('block_change', onBlockChange)
+  client.on('multi_block_change', onSectionChange)
+  return {
+    get confirmed() { return confirmed },
+    detach() {
+      client.off('block_change', onBlockChange)
+      client.off('multi_block_change', onSectionChange)
+    }
   }
 }
 
@@ -160,6 +190,7 @@ class MineflayerSession {
 
   async collect({ block, count, radius }, requestSignal) {
     let collected = 0
+    const recordPickup = () => { collected++ }
     try {
       await this.#navigate(radius, requestSignal, async ({ origin, movements, signal }) => {
         const blockType = this.#bot.registry.blocksByName[block].id
@@ -170,8 +201,7 @@ class MineflayerSession {
           const position = this.#bot.findBlocks({ point: origin, matching: blockType, maxDistance: radius, count: 32 })
             .find(position => within(center(position), origin, radius) && !this.#isFooting(position))
           if (!position) throw new BlocksideError('NO_BLOCK')
-          await this.#collectOne(position, blockType, itemType, { origin, radius, movements, signal })
-          collected++
+          await this.#collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup })
         }
       }, { closeOnAbort: true })
     } catch (error) {
@@ -220,7 +250,7 @@ class MineflayerSession {
     }
   }
 
-  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal }) {
+  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup }) {
     const bot = this.#bot
     try {
       await abortable(bot.pathfinder.goto(new goals.GoalLookAtBlock(position, bot.world)), signal)
@@ -234,26 +264,36 @@ class MineflayerSession {
       throw new BlocksideError('UNREACHABLE')
     }
 
-    const initialEntities = new Set(Object.keys(bot.entities).map(Number))
-    const drops = new Map()
+    const removal = observeRemoval(bot, position)
+    const spawned = new Set()
+    const drops = new Set()
     const before = bot.inventory.count(itemType)
     const blockCenter = center(position)
     let pickedUp = false
+    const nearTarget = entity => within(entity.position, blockCenter, 0.75) && within(entity.position, origin, radius)
+    const onSpawn = entity => {
+      if (removal.confirmed && entity.name === 'item' && nearTarget(entity)) spawned.add(entity)
+    }
     const onDrop = entity => {
-      if (!initialEntities.has(entity.id) &&
-          within(entity.position, blockCenter, 0.75) && within(entity.position, origin, radius) &&
-          entity.getDroppedItem()?.type === itemType) drops.set(entity.id, entity)
+      // Item metadata can arrive after the removal for an entity that spawned earlier.
+      if (spawned.has(entity) && nearTarget(entity) && entity.getDroppedItem()?.type === itemType) drops.add(entity)
     }
     const onPickup = (collector, entity) => {
-      if (collector.id === bot.entity.id && drops.has(entity.id)) pickedUp = true
+      if (collector.id === bot.entity.id && drops.has(entity)) pickedUp = true
     }
+    const hasConfirmedPickup = () => pickedUp && bot.inventory.count(itemType) > before
+    let confirmedAtCancel = false
+    const onAbort = () => { confirmedAtCancel = hasConfirmedPickup() }
+    bot.on('entitySpawn', onSpawn)
     bot.on('itemDrop', onDrop)
     bot.on('playerCollect', onPickup)
+    signal.addEventListener('abort', onAbort, { once: true })
     try {
       // Navigate with digging disabled. Only this explicit call breaks a block.
       await abortable(bot.dig(block), signal)
-      const drop = await until(() => pickedUp || [...drops.values()].find(entity => entity.isValid), signal, 1000)
+      const drop = await until(() => pickedUp || [...drops].find(entity => entity.isValid), signal, 1000)
       if (!drop) throw new BlocksideError('NO_PICKUP')
+      signal.throwIfAborted()
       if (!pickedUp) {
         bot.collectBlock.movements = movements
         try {
@@ -263,12 +303,17 @@ class MineflayerSession {
           if (!pickedUp) throw safeError(error, 'NO_PICKUP')
         }
       }
-      if (!await until(() => pickedUp && bot.inventory.count(itemType) > before, signal, 1000)) {
+      if (!await until(hasConfirmedPickup, signal, 1000)) {
         throw new BlocksideError('NO_PICKUP')
       }
+      signal.throwIfAborted()
     } finally {
+      signal.removeEventListener('abort', onAbort)
+      removal.detach()
+      bot.off('entitySpawn', onSpawn)
       bot.off('itemDrop', onDrop)
       bot.off('playerCollect', onPickup)
+      if (signal.aborted ? confirmedAtCancel : hasConfirmedPickup()) recordPickup()
     }
   }
 }

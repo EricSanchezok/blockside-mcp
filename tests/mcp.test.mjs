@@ -18,6 +18,7 @@ test('the shipped stdio entry advertises exactly six tools and redacts rejected 
   assert.deepEqual(status.structuredContent, { connection: 'disconnected', action: null, stopping: false })
   const rejectedInputs = [
     ['connect', { host: 'PRIVATE_MCP_TEST_VALUE', port: 444 }],
+    ['connect', { javaVersion: '26.1' }],
     ['follow', { player: 'Guide', seconds: 31 }],
     ['collect', { block: 'bedrock', count: 1, radius: 2 }],
     ['collect', { block: 'dirt', count: 4, radius: 2 }],
@@ -34,10 +35,11 @@ test('the shipped stdio entry advertises exactly six tools and redacts rejected 
   assert.equal(diagnostics(), '')
 })
 
-test('startup refuses public addresses, hostnames and extra configuration fields', { timeout: 10_000 }, async t => {
+test('startup refuses public addresses, hostnames, unsupported versions and extra fields', { timeout: 10_000 }, async t => {
   for (const config of [
     { ...offline, host: '203.0.113.1' },
     { ...offline, host: 'localhost' },
+    { ...offline, javaVersion: '26.3' },
     { ...offline, PRIVATE_MCP_TEST_VALUE: 'unused' }
   ]) {
     const path = await configFile(t, config)

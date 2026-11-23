@@ -6,7 +6,7 @@
 
 - The stdio entry loads operator configuration and starts the MCP server. The server lists the tools, validates inputs, and returns redacted results. [Entry](../src/main.mjs) · [Tools](../src/mcp.mjs)
 - The controller owns the connection and one active action, including deadlines, cancellation, and the pre-spawn retry. [Controller](../src/controller.mjs)
-- The game adapter drives Mineflayer against Java Edition 1.21.11 and confirms pickups through game events and inventory updates. [Game adapter](../src/mineflayer.mjs)
+- The game adapter drives Mineflayer against the configured Java Edition release and confirms pickups through game events and inventory updates. [Game adapter](../src/mineflayer.mjs) · [Runner setup](development.md#run-the-development-harness)
 
 ## Product direction
 

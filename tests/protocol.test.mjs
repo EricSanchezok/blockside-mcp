@@ -10,8 +10,6 @@ import { GameController } from '../src/controller.mjs'
 import { mineflayerFactory } from '../src/mineflayer.mjs'
 import { startStdio } from './stdio-fixture.mjs'
 
-const data = minecraftData(javaVersion)
-const Chunk = createChunk(javaVersion)
 const { Vec3 } = vec3
 const dirt = { x: 4, y: 64, z: 2 }
 const spawn = { x: 2.5, y: 64, z: 2.5 }
@@ -19,7 +17,7 @@ const guideId = '00000000-0000-4000-8000-000000000011'
 const dropId = '00000000-0000-4000-8000-000000000012'
 const pickupFence = 926_582_309_446n
 
-function spawnEntity(client, entityId, uuid, type, position) {
+function spawnEntity(data, client, entityId, uuid, type, position) {
   client.write('spawn_entity', {
     entityId, objectUUID: uuid, type: data.entitiesByName[type].id, ...position,
     velocity: { x: 0, y: 0, z: 0 },
@@ -27,9 +25,11 @@ function spawnEntity(client, entityId, uuid, type, position) {
   })
 }
 
-async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}) {
+async function loopback(t, { guide = false, pickup, sectionUpdate = false, version = javaVersion } = {}) {
+  const data = minecraftData(version)
+  const Chunk = createChunk(version)
   const server = protocol.createServer({
-    host: '127.0.0.1', port: 0, version: javaVersion, 'online-mode': false, hideErrors: true
+    host: '127.0.0.1', port: 0, version, 'online-mode': false, hideErrors: true
   })
   const chunk = new Chunk()
   const movements = []
@@ -37,6 +37,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
   const digging = Promise.withResolvers()
   const following = Promise.withResolvers()
   const pickupProcessed = Promise.withResolvers()
+  let wireVersion
   let dropPosition
   let pickupSent = false
   let playerLoaded = false
@@ -48,6 +49,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
   if (pickup) chunk.setBlockStateId(new Vec3(dirt.x, dirt.y, dirt.z), data.blocksByName.dirt.defaultState)
 
   server.on('playerJoin', client => {
+    wireVersion = client.protocolVersion
     client.on('player_loaded', () => { playerLoaded = true })
     client.write('login', { ...data.loginPacket, entityId: client.id })
     client.write('map_chunk', {
@@ -58,7 +60,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
         action: { add_player: true },
         data: [{ uuid: guideId, player: { name: 'Guide', properties: [] } }]
       })
-      spawnEntity(client, 10, guideId, 'player', { x: 7.5, y: 64, z: 2.5 })
+      spawnEntity(data, client, 10, guideId, 'player', { x: 7.5, y: 64, z: 2.5 })
     }
     client.write('position', { ...spawn, teleportId: 1, dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: {} })
     client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
@@ -94,7 +96,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
       if (status === 0) digging.resolve(location)
       if (status !== 2 || !pickup) return
       dropPosition = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
-      const spawnDrop = () => spawnEntity(client, 11, dropId, 'item', dropPosition)
+      const spawnDrop = () => spawnEntity(data, client, 11, dropId, 'item', dropPosition)
       if (pickup === 'unrelated') spawnDrop()
       const air = data.blocksByName.air.defaultState
       if (sectionUpdate) {
@@ -116,6 +118,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
   const host = '127.0.0.1'
   const port = server.socketServer.address().port
   const config = { host, port, auth: 'offline', profile: 'FixtureBot' }
+  if (version !== javaVersion) config.javaVersion = version
   const game = new GameController(mineflayerFactory(config))
   t.after(async () => {
     game.disconnect()
@@ -126,7 +129,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
   return {
     config, game, movements, digs, digging: digging.promise, following: following.promise,
     pickupProcessed: pickupProcessed.promise,
-    loaded: () => playerLoaded, sentPickup: () => pickupSent
+    wireVersion: () => wireVersion, loaded: () => playerLoaded, sentPickup: () => pickupSent
   }
 }
 
@@ -134,6 +137,7 @@ test('Java 1.21.11 loopback spawn, follow movement and disconnect', { timeout: 1
   const fixture = await loopback(t, { guide: true })
   const { game } = fixture
   assert.equal((await game.connect()).connection, 'connected')
+  assert.equal(fixture.wireVersion(), 774)
   assert.deepEqual(await game.follow({ player: 'Guide', seconds: 2 }), { followed: true, seconds: 2 })
   assert.equal(fixture.loaded(), true)
   assert.ok(fixture.movements.some(x => x > spawn.x + 1))
@@ -158,6 +162,26 @@ test('the shipped stdio runner stops an active follow when the MCP client cancel
   assert.equal((await client.callTool({ name: 'disconnect' })).structuredContent.connection, 'disconnected')
 })
 
+test('the shipped stdio runner uses Java 26.1 protocol 775 and stops an active follow', { timeout: 10_000 }, async t => {
+  const fixture = await loopback(t, { version: '26.1', guide: true })
+  const { client, diagnostics } = await startStdio(t, fixture.config)
+  assert.equal((await client.callTool({ name: 'connect' })).structuredContent.connection, 'connected')
+  assert.equal(fixture.wireVersion(), 775)
+  const follow = client.callTool({ name: 'follow', arguments: { player: 'Guide', seconds: 5 } })
+  await fixture.following
+  assert.equal((await client.callTool({ name: 'stop' })).structuredContent.stopped, true)
+  const result = await follow
+  assert.equal(result.isError, true)
+  assert.equal(result.structuredContent.code, 'CANCELED')
+  assert.deepEqual((await client.callTool({ name: 'status' })).structuredContent, {
+    connection: 'connected', action: null, stopping: false
+  })
+  assert.equal(fixture.loaded(), true)
+  assert.deepEqual(fixture.digs, [])
+  assert.equal((await client.callTool({ name: 'disconnect' })).structuredContent.connection, 'disconnected')
+  assert.equal(diagnostics(), '')
+})
+
 test('Java 1.21.11 loopback collection confirms the pickup and reports a partial count', { timeout: 10_000 }, async t => {
   const fixture = await loopback(t, { pickup: 'confirmed', sectionUpdate: true })
   await fixture.game.connect()
@@ -170,14 +194,16 @@ test('Java 1.21.11 loopback collection confirms the pickup and reports a partial
   assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
 })
 
-test('Java 1.21.11 loopback collection returns a receipt for a completed pickup', { timeout: 10_000 }, async t => {
-  const fixture = await loopback(t, { pickup: 'confirmed' })
-  await fixture.game.connect()
-  assert.deepEqual(await fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), {
-    block: 'dirt', requested: 1, collected: 1
+for (const version of [javaVersion, '26.1']) {
+  test(`Java ${version} loopback collection returns a receipt for a completed pickup`, { timeout: 10_000 }, async t => {
+    const fixture = await loopback(t, { pickup: 'confirmed', version })
+    await fixture.game.connect()
+    assert.deepEqual(await fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), {
+      block: 'dirt', requested: 1, collected: 1
+    })
+    assert.equal(fixture.sentPickup(), true)
   })
-  assert.equal(fixture.sentPickup(), true)
-})
+}
 
 test('Java 1.21.11 loopback item disappearance without inventory gain gives no receipt', { timeout: 10_000 }, async t => {
   const fixture = await loopback(t, { pickup: 'unconfirmed' })

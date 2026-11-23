@@ -22,7 +22,7 @@ const tools = new Map([
     run: (game, input, signal) => game.follow(input, signal)
   }],
   ['collect', {
-    description: 'Collect up to three dirt or oak log drops within the specified radius.',
+    description: 'Collect up to three matching dirt or oak log items within the radius after confirmed breaks. The receipt counts observed pickups. Item origin remains unverified.',
     schema: z.strictObject({
       block: z.enum(['dirt', 'oak_log']),
       count: z.number().int().min(1).max(3),

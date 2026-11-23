@@ -350,22 +350,27 @@ class MineflayerSession {
 
     const pickup = observePickup(bot, position, itemType, origin, radius)
     const work = AbortSignal.any([signal, pickup.signal])
-    let pursuing = false
+    let operationPending = false
+    const waitForOperation = operation => {
+      operationPending = true
+      return abortable(operation.finally(() => { operationPending = false }), work)
+    }
     let confirmedAtCancel = false
     const onAbort = () => { confirmedAtCancel = pickup.confirmed() }
     signal.addEventListener('abort', onAbort, { once: true })
     try {
-      // Navigate with digging disabled. Only this explicit call breaks a block.
-      await abortable(bot.dig(block), work)
+      // Mineflayer registers its dig cancellation after turning toward the block.
+      await waitForOperation(bot.lookAt(center(block.position)))
+      work.throwIfAborted()
+      await waitForOperation(bot.dig(block, 'ignore'))
       const drop = await until(pickup.ready, work, 1000)
       if (!drop) throw pickup.failure()
       work.throwIfAborted()
       if (!pickup.pickedUp) {
         pickup.pursue(drop)
-        pursuing = true
         bot.collectBlock.movements = movements
         try {
-          await abortable(bot.collectBlock.collect(drop, { chestLocations: [] }), work)
+          await waitForOperation(bot.collectBlock.collect(drop, { chestLocations: [] }))
         } catch {
           work.throwIfAborted()
           if (!pickup.pickedUp) throw pickup.failure()
@@ -377,7 +382,7 @@ class MineflayerSession {
       signal.removeEventListener('abort', onAbort)
       pickup.detach()
       if (signal.aborted ? confirmedAtCancel : pickup.confirmed()) recordPickup()
-      if (pursuing && pickup.signal.aborted && !signal.aborted) this.close()
+      if (operationPending) this.close()
     }
   }
 }

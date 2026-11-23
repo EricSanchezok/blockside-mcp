@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { test } from 'node:test'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 import minecraftData from 'minecraft-data'
 import protocol from 'minecraft-protocol'
+import mineflayer from 'mineflayer'
 import createChunk from 'prismarine-chunk'
 import vec3 from 'vec3'
 import { javaVersion } from '../src/config.mjs'
@@ -19,12 +21,22 @@ const guideId = '00000000-0000-4000-8000-000000000011'
 const dropId = '00000000-0000-4000-8000-000000000012'
 const competingDropId = '00000000-0000-4000-8000-000000000013'
 const pickupFence = 926_582_309_446n
+const dropOrigin = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
 
 function spawnEntity(client, entityId, uuid, type, position) {
   client.write('spawn_entity', {
     entityId, objectUUID: uuid, type: data.entitiesByName[type].id, ...position,
     velocity: { x: 0, y: 0, z: 0 },
     yaw: 0, pitch: 0, headPitch: 0, objectData: 0
+  })
+}
+
+function configureBotOnSpawn(t, configure) {
+  const createBot = mineflayer.createBot
+  t.mock.method(mineflayer, 'createBot', options => {
+    const bot = createBot(options)
+    bot.once('spawn', () => configure(bot))
+    return bot
   })
 }
 
@@ -38,6 +50,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
   const digging = Promise.withResolvers()
   const following = Promise.withResolvers()
   const pickupProcessed = Promise.withResolvers()
+  const drops = Promise.withResolvers()
   let dropPosition
   let pickupSent = false
   let playerLoaded = false
@@ -72,10 +85,18 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
       entityId,
       metadata: [{ key: data.supportFeature('metadataIxOfItem'), type: 'item_stack', value: item }]
     })
+    const spawnDrop = () => spawnEntity(client, 11, dropId, 'item', dropOrigin)
     const announceCompetingDrop = () => {
-      spawnEntity(client, 12, competingDropId, 'item', { ...dropPosition, z: dropPosition.z + 0.15 })
+      spawnEntity(client, 12, competingDropId, 'item', { ...dropOrigin, z: dropOrigin.z + 0.15 })
       announceItem(12)
     }
+    drops.resolve({
+      announceDrop() {
+        spawnDrop()
+        announceItem(11)
+      },
+      announceCompetingDrop
+    })
     const sendPickup = (entityId = 11) => {
       pickupSent = true
       client.write('collect', { collectedEntityId: entityId, collectorEntityId: client.id, pickupItemCount: 1 })
@@ -98,7 +119,12 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
         announceCompetingDrop()
         sendPickup(12)
       } else if (Math.hypot(position.x - dropPosition.x, position.z - dropPosition.z) <= 0.9) {
-        sendPickup()
+        if (pickup === 'empty-pursuit') {
+          client.write('entity_destroy', { entityIds: [11] })
+          dropPosition = null
+        } else {
+          sendPickup()
+        }
       }
     }
     client.on('position', onMovement)
@@ -107,7 +133,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
       digs.push({ status, location })
       if (status === 0) digging.resolve(location)
       if (status !== 2 || !pickup) return
-      dropPosition = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
+      dropPosition = dropOrigin
       if (spawnBeforeRemoval || pickup === 'unrelated') spawnEntity(client, 11, dropId, 'item', dropPosition)
       if (spawnBeforeRemoval) announceItem(11)
       const air = data.blocksByName.air.defaultState
@@ -142,7 +168,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
   })
   return {
     config, game, movements, digs, digging: digging.promise, following: following.promise,
-    pickupProcessed: pickupProcessed.promise,
+    pickupProcessed: pickupProcessed.promise, drops: drops.promise,
     loaded: () => playerLoaded, sentPickup: () => pickupSent
   }
 }
@@ -246,6 +272,73 @@ test('Java 1.21.11 loopback stops a pursuit when a competing item appears', { ti
   assert.equal(fixture.game.status().connection, 'disconnected')
   assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
 })
+
+test('Java 1.21.11 loopback keeps the connection on a conflict after an empty pursuit ends', { timeout: 10_000 }, async t => {
+  const finished = Promise.withResolvers()
+  configureBotOnSpawn(t, bot => bot.once('collectBlock_finished', () => finished.resolve()))
+  const fixture = await loopback(t, { pickup: 'empty-pursuit' })
+  await fixture.game.connect()
+  const failure = assert.rejects(fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), error => {
+    assert.equal(error.code, 'PICKUP_AMBIGUOUS')
+    assert.deepEqual(error.receipt, { block: 'dirt', requested: 1, collected: 0 })
+    return true
+  })
+  await finished.promise
+  const { announceCompetingDrop } = await fixture.drops
+  announceCompetingDrop()
+  await failure
+  assert.equal(fixture.game.status().connection, 'connected')
+})
+
+for (const { operation, code } of [
+  { operation: 'a pickup conflict', code: 'PICKUP_AMBIGUOUS' },
+  { operation: 'explicit stop', code: 'CANCELED' }
+]) {
+  test(`Java 1.21.11 loopback prevents a delayed dig start after ${operation}`, { timeout: 10_000 }, async t => {
+    const looking = Promise.withResolvers()
+    const release = Promise.withResolvers()
+    const digWrites = []
+    configureBotOnSpawn(t, bot => {
+      const lookAt = bot.lookAt
+      const write = bot._client.write.bind(bot._client)
+      t.mock.method(bot, 'lookAt', async (...args) => {
+        await lookAt(...args)
+        looking.resolve()
+        await release.promise
+      })
+      t.mock.method(bot._client, 'write', (name, packet) => {
+        if (name === 'block_dig') digWrites.push(packet.status)
+        return write(name, packet)
+      })
+      t.after(() => bot.stopDigging())
+    })
+    t.after(release.resolve)
+    const fixture = await loopback(t, { pickup: 'confirmed' })
+    const { game } = fixture
+    await game.connect()
+    const stopped = assert.rejects(game.collect({ block: 'dirt', count: 1, radius: 5 }), error => {
+      assert.equal(error.code, code)
+      assert.equal(error.receipt.collected, 0)
+      return true
+    })
+
+    await looking.promise
+    assert.deepEqual(digWrites, [])
+    if (code === 'CANCELED') {
+      assert.equal(game.stop().stopped, true)
+    } else {
+      const { announceDrop, announceCompetingDrop } = await fixture.drops
+      announceDrop()
+      announceCompetingDrop()
+    }
+    await stopped
+    release.resolve()
+    await nextTurn()
+    assert.deepEqual(digWrites.slice(), [])
+    assert.deepEqual(fixture.digs, [])
+    assert.equal(game.status().connection, 'disconnected')
+  })
+}
 
 test('Java 1.21.11 loopback stop preserves a confirmed pickup while collection is pending', { timeout: 10_000 }, async t => {
   const fixture = await loopback(t, { pickup: 'pending' })

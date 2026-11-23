@@ -20,7 +20,8 @@ const configSchema = z.strictObject({
   host: z.string().refine(isLocalAddress),
   port: z.number().int().min(1).max(65535),
   auth: z.enum(['offline', 'microsoft']),
-  profile: playerName
+  profile: playerName,
+  javaVersion: z.enum([javaVersion, '26.1']).optional()
 })
 
 export async function loadConfig(args) {

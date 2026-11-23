@@ -68,7 +68,7 @@ class MineflayerSession {
         port: config.port,
         username: config.profile,
         auth: config.auth,
-        version: javaVersion,
+        version: config.javaVersion ?? javaVersion,
         hideErrors: true,
         logErrors: false,
         respawn: false

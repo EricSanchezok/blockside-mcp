@@ -50,6 +50,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
   const digging = Promise.withResolvers()
   const following = Promise.withResolvers()
   const pickupProcessed = Promise.withResolvers()
+  const inventoryReleased = Promise.withResolvers()
   const drops = Promise.withResolvers()
   let dropPosition
   let pickupSent = false
@@ -98,12 +99,23 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
     const sendPickup = (entityId = 11) => {
       pickupSent = true
       client.write('collect', { collectedEntityId: entityId, collectorEntityId: client.id, pickupItemCount: 1 })
-      if (pickup !== 'unconfirmed') client.write('set_player_inventory', { slotId: 0, contents: item })
-      if (pickup === 'pending') {
-        // The reply proves the bot processed the collect and inventory packets in order.
+      const sendInventorySlot = () => client.write('set_player_inventory', { slotId: 0, contents: item })
+      if (pickup === 'cursor-only') {
+        client.write('window_items', {
+          windowId: 0, stateId: 1, items: Array.from({ length: 46 }, () => ({ itemCount: 0 })), carriedItem: item
+        })
+      } else if (pickup === 'delayed-slot') {
+        inventoryReleased.promise.then(() => {
+          sendInventorySlot()
+          sendInventorySlot()
+        })
+      } else if (pickup !== 'unconfirmed') {
+        sendInventorySlot()
+      }
+      if (pickup !== 'pending') client.write('entity_destroy', { entityIds: [entityId] })
+      if (pickup === 'pending' || pickup === 'delayed-slot') {
+        // The reply shows the client has processed the earlier packets on this connection.
         client.write('keep_alive', { keepAliveId: pickupFence })
-      } else {
-        client.write('entity_destroy', { entityIds: [entityId] })
       }
     }
     client.on('keep_alive', ({ keepAliveId }) => {
@@ -172,7 +184,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
   })
   return {
     config, game, movements, digs, digging: digging.promise, following: following.promise,
-    pickupProcessed: pickupProcessed.promise, drops: drops.promise,
+    pickupProcessed: pickupProcessed.promise, releaseInventory: inventoryReleased.resolve, drops: drops.promise,
     loaded: () => playerLoaded, sentPickup: () => pickupSent
   }
 }
@@ -246,6 +258,48 @@ test('Java 1.21.11 loopback item disappearance without inventory gain gives no r
     return true
   })
   assert.equal(fixture.sentPickup(), true)
+})
+
+test('Java 1.21.11 loopback does not count a pickup held only on the cursor', { timeout: 10_000 }, async t => {
+  let inventory
+  configureBotOnSpawn(t, bot => { inventory = bot.inventory })
+  const fixture = await loopback(t, { pickup: 'cursor-only' })
+  await fixture.game.connect()
+  await assert.rejects(fixture.game.collect({ block: 'dirt', count: 1, radius: 5 }), error => {
+    assert.equal(error.code, 'NO_PICKUP')
+    assert.deepEqual(error.receipt, { block: 'dirt', requested: 1, collected: 0 })
+    return true
+  })
+  assert.equal(fixture.sentPickup(), true)
+  assert.equal(inventory.selectedItem?.name, 'dirt')
+  assert.equal(inventory.selectedItem.count, 1)
+  assert.deepEqual(inventory.items(), [])
+})
+
+test('Java 1.21.11 loopback settles a delayed pickup once despite a repeated slot update', { timeout: 10_000 }, async t => {
+  let inventory
+  const slotsProcessed = Promise.withResolvers()
+  configureBotOnSpawn(t, bot => {
+    inventory = bot.inventory
+    let updates = 0
+    bot._client.on('set_player_inventory', () => {
+      if (++updates === 2) slotsProcessed.resolve()
+    })
+  })
+  const fixture = await loopback(t, { pickup: 'delayed-slot' })
+  const { game } = fixture
+  await game.connect()
+  const collection = game.collect({ block: 'dirt', count: 1, radius: 5 })
+
+  await Promise.race([fixture.pickupProcessed, collection])
+  assert.equal(game.status().action, 'collect')
+  assert.deepEqual(inventory.items(), [])
+  fixture.releaseInventory()
+
+  const [receipt] = await Promise.all([collection, slotsProcessed.promise])
+  assert.deepEqual(receipt, { block: 'dirt', requested: 1, collected: 1 })
+  assert.equal(inventory.count(data.itemsByName.dirt.id), 1)
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
 })
 
 test('Java 1.21.11 loopback leaves a prematurely collected early drop ambiguous', { timeout: 10_000 }, async t => {

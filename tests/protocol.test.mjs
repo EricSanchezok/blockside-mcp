@@ -14,7 +14,7 @@ import { startStdio } from './stdio-fixture.mjs'
 const data = minecraftData(javaVersion)
 const Chunk = createChunk(javaVersion)
 const { Vec3 } = vec3
-const dirt = { x: 4, y: 64, z: 2 }
+const pickupPosition = { x: 4, y: 64, z: 2 }
 const spawn = { x: 2.5, y: 64, z: 2.5 }
 const guideId = '00000000-0000-4000-8000-000000000011'
 const guideEntityId = 10
@@ -39,7 +39,7 @@ function guidePosition(x) {
   }
 }
 
-async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}) {
+async function loopback(t, { guide = false, pickup, sectionUpdate = false, resource = 'dirt', obstacles = [] } = {}) {
   const server = protocol.createServer({
     host: '127.0.0.1', port: 0, version: javaVersion, 'online-mode': false, hideErrors: true
   })
@@ -54,12 +54,19 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
   let dropPosition
   let pickupSent = false
   let playerLoaded = false
+  const stone = data.blocksByName.stone.defaultState
   for (let x = 0; x < 16; x++) {
     for (let z = 0; z < 16; z++) {
-      chunk.setBlockStateId(new Vec3(x, 63, z), data.blocksByName.stone.defaultState)
+      chunk.setBlockStateId(new Vec3(x, 63, z), stone)
     }
   }
-  if (pickup) chunk.setBlockStateId(new Vec3(dirt.x, dirt.y, dirt.z), data.blocksByName.dirt.defaultState)
+  for (const { x, y, z } of obstacles) {
+    chunk.setBlockStateId(new Vec3(x, y, z), stone)
+  }
+  if (pickup) {
+    const { x, y, z } = pickupPosition
+    chunk.setBlockStateId(new Vec3(x, y, z), data.blocksByName[resource].defaultState)
+  }
 
   server.on('playerJoin', client => {
     connectedClient = client
@@ -77,7 +84,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
     client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
 
     const item = {
-      itemCount: 1, itemId: data.itemsByName.dirt.id,
+      itemCount: 1, itemId: data.itemsByName[resource].id,
       addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: []
     }
     const sendPickup = () => {
@@ -106,15 +113,16 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false } = {}
       digs.push({ status, location })
       if (status === 0) digging.resolve(location)
       if (status !== 2 || !pickup) return
-      dropPosition = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
+      const { x, y, z } = pickupPosition
+      dropPosition = { x: x + 0.5, y: y + 0.25, z: z + 0.5 }
       const spawnDrop = () => spawnEntity(client, 11, dropId, 'item', dropPosition)
       if (pickup === 'unrelated') spawnDrop()
       const air = data.blocksByName.air.defaultState
       if (sectionUpdate) {
-        const record = (air << 12) | (dirt.x << 8) | (dirt.z << 4) | (dirt.y & 15)
+        const record = (air << 12) | (x << 8) | (z << 4) | (y & 15)
         client.write('multi_block_change', { chunkCoordinates: { x: 0, y: 4, z: 0 }, records: [record] })
       } else {
-        client.write('block_change', { location: dirt, type: air })
+        client.write('block_change', { location: pickupPosition, type: air })
       }
       if (pickup !== 'unrelated') spawnDrop()
       client.write('entity_metadata', {
@@ -173,6 +181,58 @@ test('the shipped stdio runner stops an active follow when the MCP client cancel
   assert.deepEqual((await client.callTool({ name: 'status' })).structuredContent, {
     connection: 'connected', action: null, stopping: false
   })
+  assert.equal((await client.callTool({ name: 'disconnect' })).structuredContent.connection, 'disconnected')
+})
+
+test('the shipped runner rejects an occluded dig, stops a detour and collects on the same connection', { timeout: 15_000 }, async t => {
+  const wallX = pickupPosition.x - 1
+  const openingZ = 5
+  const obstacles = Array.from({ length: 16 }, (_, z) => [64, 65].map(y => ({ x: wallX, y, z }))).flat()
+  const fixture = await loopback(t, { guide: true, pickup: 'confirmed', resource: 'oak_log', obstacles })
+  const { client } = await startStdio(t, fixture.config)
+  assert.equal((await client.callTool({ name: 'connect' })).structuredContent.connection, 'connected')
+
+  const collect = { name: 'collect', arguments: { block: 'oak_log', count: 1, radius: 8 } }
+  const blocked = await Promise.race([client.callTool(collect), fixture.digging.then(() => null)])
+  assert.ok(blocked, 'The blocked collection sent a dig packet')
+  assert.equal(blocked.isError, true)
+  assert.equal(blocked.structuredContent.code, 'UNREACHABLE')
+  assert.deepEqual(blocked.structuredContent.receipt, { block: 'oak_log', requested: 1, collected: 0 })
+
+  const terrainFence = 826_056_318_267n
+  const passageApplied = once(fixture.client, 'keep_alive')
+  for (const location of obstacles.filter(position => position.z === openingZ)) {
+    fixture.client.write('block_change', { location, type: data.blocksByName.air.defaultState })
+  }
+  fixture.client.write('keep_alive', { keepAliveId: terrainFence })
+  const [reply] = await passageApplied
+  assert.equal(BigInt(reply.keepAliveId), terrainFence)
+
+  const crossed = Promise.withResolvers()
+  const observePassage = ({ x, z }) => {
+    if (x > wallX + 0.5 && Math.abs(z - (openingZ + 0.5)) < 0.75) crossed.resolve()
+  }
+  fixture.client.on('position', observePassage)
+  fixture.client.on('position_look', observePassage)
+  const follow = client.callTool({ name: 'follow', arguments: { player: 'Guide', seconds: 20 } })
+  try {
+    await Promise.race([crossed.promise, follow.then(() => assert.fail('Follow ended before reaching the passage'))])
+  } finally {
+    fixture.client.off('position', observePassage)
+    fixture.client.off('position_look', observePassage)
+  }
+  assert.equal((await client.callTool({ name: 'stop' })).structuredContent.stopped, true)
+  assert.equal((await follow).structuredContent.code, 'CANCELED')
+  assert.deepEqual((await client.callTool({ name: 'status' })).structuredContent, {
+    connection: 'connected', action: null, stopping: false
+  })
+  assert.deepEqual(fixture.digs, [])
+
+  const collected = await client.callTool(collect)
+  assert.deepEqual(collected.structuredContent, { block: 'oak_log', requested: 1, collected: 1 })
+  assert.deepEqual(fixture.digs, [{ status: 0, location: pickupPosition }, { status: 2, location: pickupPosition }])
+  assert.equal(fixture.sentPickup(), true)
+  assert.equal(fixture.joins, 1)
   assert.equal((await client.callTool({ name: 'disconnect' })).structuredContent.connection, 'disconnected')
 })
 
@@ -256,7 +316,7 @@ test('Java 1.21.11 loopback collection confirms the pickup and reports a partial
     return true
   })
   assert.equal(fixture.sentPickup(), true)
-  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: pickupPosition }])
 })
 
 test('Java 1.21.11 loopback collection returns a receipt for a completed pickup', { timeout: 10_000 }, async t => {
@@ -288,7 +348,7 @@ test('Java 1.21.11 loopback collection rejects a same-type drop spawned before t
     return true
   })
   assert.equal(fixture.sentPickup(), true)
-  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: pickupPosition }])
 })
 
 test('Java 1.21.11 loopback stop preserves a confirmed pickup while collection is pending', { timeout: 10_000 }, async t => {
@@ -304,7 +364,7 @@ test('Java 1.21.11 loopback stop preserves a confirmed pickup while collection i
   assert.equal(fixture.game.status().action, 'collect')
   assert.equal(fixture.game.stop().connection, 'disconnected')
   await stopped
-  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+  assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: pickupPosition }])
 })
 
 test('Java 1.21.11 loopback stop closes the session during a dig', { timeout: 10_000 }, async t => {
@@ -316,7 +376,7 @@ test('Java 1.21.11 loopback stop closes the session during a dig', { timeout: 10
     assert.equal(error.receipt.collected, 0)
     return true
   })
-  assert.deepEqual(await fixture.digging, dirt)
+  assert.deepEqual(await fixture.digging, pickupPosition)
   assert.equal(fixture.game.stop().connection, 'disconnected')
   await stopped
   assert.equal(fixture.digs.some(dig => dig.status === 2), false)

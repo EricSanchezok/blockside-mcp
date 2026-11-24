@@ -21,8 +21,6 @@ const guideId = '00000000-0000-4000-8000-000000000011'
 const dropId = '00000000-0000-4000-8000-000000000012'
 const competingDropId = '00000000-0000-4000-8000-000000000013'
 const pickupFence = 926_582_309_446n
-const dropOrigin = { x: dirt.x + 0.5, y: dirt.y + 0.25, z: dirt.z + 0.5 }
-
 function spawnEntity(client, entityId, uuid, type, position) {
   client.write('spawn_entity', {
     entityId, objectUUID: uuid, type: data.entitiesByName[type].id, ...position,
@@ -40,27 +38,36 @@ function configureBotOnSpawn(t, configure) {
   })
 }
 
-async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawnBeforeRemoval = false } = {}) {
+async function loopback(t, {
+  guide = false, pickup, sectionUpdate = false, spawnBeforeRemoval = false,
+  target = dirt, material = 'dirt', terrain = []
+} = {}) {
   const server = protocol.createServer({
     host: '127.0.0.1', port: 0, version: javaVersion, 'online-mode': false, hideErrors: true
   })
   const chunk = new Chunk()
   const movements = []
   const digs = []
+  const digOrigins = []
   const digging = Promise.withResolvers()
   const following = Promise.withResolvers()
   const pickupProcessed = Promise.withResolvers()
   const inventoryReleased = Promise.withResolvers()
   const drops = Promise.withResolvers()
+  const targetBlock = new Vec3(target.x, target.y, target.z)
+  const dropOrigin = targetBlock.offset(0.5, 0.25, 0.5)
   let dropPosition
   let pickupSent = false
   let playerLoaded = false
+  let inventorySlot
+  let lastPosition = spawn
   for (let x = 0; x < 16; x++) {
     for (let z = 0; z < 16; z++) {
       chunk.setBlockStateId(new Vec3(x, 63, z), data.blocksByName.stone.defaultState)
     }
   }
-  if (pickup) chunk.setBlockStateId(new Vec3(dirt.x, dirt.y, dirt.z), data.blocksByName.dirt.defaultState)
+  for (const { position, block } of terrain) chunk.setBlockStateId(position, data.blocksByName[block].defaultState)
+  if (pickup) chunk.setBlockStateId(targetBlock, data.blocksByName[material].defaultState)
 
   server.on('playerJoin', client => {
     client.on('player_loaded', () => { playerLoaded = true })
@@ -79,7 +86,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
     client.write('update_health', { health: 20, food: 20, foodSaturation: 5 })
 
     const item = {
-      itemCount: 1, itemId: data.itemsByName.dirt.id,
+      itemCount: 1, itemId: data.itemsByName[material].id,
       addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: []
     }
     const announceItem = entityId => client.write('entity_metadata', {
@@ -99,7 +106,10 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
     const sendPickup = (entityId = 11) => {
       pickupSent = true
       client.write('collect', { collectedEntityId: entityId, collectorEntityId: client.id, pickupItemCount: 1 })
-      const sendInventorySlot = () => client.write('set_player_inventory', { slotId: 0, contents: item })
+      const sendInventorySlot = () => {
+        inventorySlot = item
+        client.write('set_player_inventory', { slotId: 0, contents: inventorySlot })
+      }
       if (pickup === 'cursor-only') {
         client.write('window_items', {
           windowId: 0, stateId: 1, items: Array.from({ length: 46 }, () => ({ itemCount: 0 })), carriedItem: item
@@ -122,6 +132,7 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
       if (BigInt(keepAliveId) === pickupFence) pickupProcessed.resolve()
     })
     const onMovement = position => {
+      lastPosition = position
       movements.push(position.x)
       if (guide && position.x > spawn.x + 0.25) following.resolve()
       if (!dropPosition || pickupSent) return
@@ -142,22 +153,24 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
     client.on('block_dig', ({ status, location }) => {
       digs.push({ status, location })
       if (status === 0) {
+        digOrigins.push(new Vec3(lastPosition.x, lastPosition.y, lastPosition.z))
         digging.resolve(location)
         if (pickup === 'unrelated-at-start') {
           dropPosition = dropOrigin
           announceDrop()
         }
       }
-      if (status !== 2 || !pickup) return
+      if (status !== 2 || !pickup || !targetBlock.equals(location)) return
       dropPosition = dropOrigin
       if (spawnBeforeRemoval || pickup === 'unrelated') spawnEntity(client, 11, dropId, 'item', dropPosition)
       if (spawnBeforeRemoval) announceItem(11)
       const air = data.blocksByName.air.defaultState
+      chunk.setBlockStateId(targetBlock, air)
       if (sectionUpdate) {
-        const record = (air << 12) | (dirt.x << 8) | (dirt.z << 4) | (dirt.y & 15)
-        client.write('multi_block_change', { chunkCoordinates: { x: 0, y: 4, z: 0 }, records: [record] })
+        const record = (air << 12) | (target.x << 8) | (target.z << 4) | (target.y & 15)
+        client.write('multi_block_change', { chunkCoordinates: { x: 0, y: target.y >> 4, z: 0 }, records: [record] })
       } else {
-        client.write('block_change', { location: dirt, type: air })
+        client.write('block_change', { location: target, type: air })
       }
       if (!spawnBeforeRemoval && pickup !== 'unrelated-at-start') {
         if (pickup !== 'unrelated') spawnEntity(client, 11, dropId, 'item', dropPosition)
@@ -183,10 +196,18 @@ async function loopback(t, { guide = false, pickup, sectionUpdate = false, spawn
     await closed
   })
   return {
-    config, game, movements, digs, digging: digging.promise, following: following.promise,
+    config, game, movements, digs, digOrigins, digging: digging.promise, following: following.promise,
     pickupProcessed: pickupProcessed.promise, releaseInventory: inventoryReleased.resolve, drops: drops.promise,
-    loaded: () => playerLoaded, sentPickup: () => pickupSent
+    loaded: () => playerLoaded, sentPickup: () => pickupSent,
+    blockAt: position => chunk.getBlock(position).name,
+    inventory: () => inventorySlot && { itemId: inventorySlot.itemId, count: inventorySlot.itemCount }
   }
+}
+
+function buriedResource(block) {
+  const position = new Vec3(dirt.x, dirt.y, dirt.z)
+  const coveringBlocks = [[-1, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]]
+  return [{ position, block }, ...coveringBlocks.map(([x, y, z]) => ({ position: position.offset(x, y, z), block: 'stone' }))]
 }
 
 test('Java 1.21.11 loopback spawn, follow movement and disconnect', { timeout: 10_000 }, async t => {
@@ -227,6 +248,45 @@ test('Java 1.21.11 loopback collection confirms the pickup and reports a partial
   })
   assert.equal(fixture.sentPickup(), true)
   assert.deepEqual(fixture.digs.filter(dig => dig.status === 2), [{ status: 2, location: dirt }])
+})
+
+test('the shipped collect tool picks exposed dirt past a closer buried block', { timeout: 10_000 }, async t => {
+  const target = new Vec3(2, 64, 6)
+  const fixture = await loopback(t, { pickup: 'confirmed', target, terrain: buriedResource('dirt') })
+  const { client } = await startStdio(t, fixture.config)
+  assert.equal((await client.callTool({ name: 'connect' })).structuredContent.connection, 'connected')
+
+  const result = await client.callTool({ name: 'collect', arguments: { block: 'dirt', count: 1, radius: 6 } })
+  assert.equal(result.isError, undefined)
+  assert.deepEqual(result.structuredContent, { block: 'dirt', requested: 1, collected: 1 })
+  assert.deepEqual(fixture.digs, [{ status: 0, location: { ...target } }, { status: 2, location: { ...target } }])
+  assert.equal(fixture.blockAt(target), 'air')
+  assert.equal(fixture.blockAt(new Vec3(dirt.x, dirt.y, dirt.z)), 'dirt')
+  assert.deepEqual(fixture.inventory(), { itemId: data.itemsByName.dirt.id, count: 1 })
+})
+
+test('the shipped collect tool reports partial oak log collection when the rest are inaccessible', { timeout: 12_000 }, async t => {
+  const target = new Vec3(1, 64, 6)
+  const outside = new Vec3(2, 64, 11)
+  const terrain = [...buriedResource('oak_log'), { position: outside, block: 'oak_log' }]
+  for (let x = 0; x < 4; x++) terrain.push({ position: new Vec3(x, 64, 5), block: 'stone' })
+  const fixture = await loopback(t, { pickup: 'confirmed', target, material: 'oak_log', terrain })
+  const { client } = await startStdio(t, fixture.config)
+  assert.equal((await client.callTool({ name: 'connect' })).structuredContent.connection, 'connected')
+
+  const result = await client.callTool({ name: 'collect', arguments: { block: 'oak_log', count: 2, radius: 7 } })
+  assert.equal(result.isError, true)
+  assert.equal(result.structuredContent.code, 'UNREACHABLE')
+  assert.deepEqual(result.structuredContent.receipt, { block: 'oak_log', requested: 2, collected: 1 })
+  assert.deepEqual(fixture.digs, [{ status: 0, location: { ...target } }, { status: 2, location: { ...target } }])
+  assert.ok(fixture.digOrigins[0].distanceTo(spawn) > 0.5)
+  assert.equal(fixture.blockAt(target), 'air')
+  assert.equal(fixture.blockAt(new Vec3(dirt.x, dirt.y, dirt.z)), 'oak_log')
+  assert.equal(fixture.blockAt(outside), 'oak_log')
+  assert.deepEqual(fixture.inventory(), { itemId: data.itemsByName.oak_log.id, count: 1 })
+  assert.deepEqual((await client.callTool({ name: 'status' })).structuredContent, {
+    connection: 'connected', action: null, stopping: false
+  })
 })
 
 test('Java 1.21.11 loopback confirms a targeted pickup when the item spawns after removal', { timeout: 10_000 }, async t => {

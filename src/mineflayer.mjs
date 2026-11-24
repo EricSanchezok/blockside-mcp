@@ -9,6 +9,7 @@ import { abortable, BlocksideError, safeError } from './errors.mjs'
 
 const { Movements, goals, pathfinder } = pathfinderPlugin
 const followRadius = 16
+const collectReach = 4.5
 const transientErrors = new Set(['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE'])
 const airBlocks = new Set(['air', 'cave_air', 'void_air'])
 
@@ -18,6 +19,30 @@ function center(position) {
 
 function within(position, origin, radius) {
   return position?.distanceTo(origin) <= radius
+}
+
+function isFooting(position, feet) {
+  return feet.floored().offset(0, -1, 0).equals(position)
+}
+
+function hasCollectReach(bot, position, feet) {
+  if (isFooting(position, feet)) return false
+  const eye = feet.offset(0, bot.entity.eyeHeight, 0)
+  const ray = center(position).minus(eye)
+  const distance = ray.norm()
+  if (!(distance > 0 && distance <= collectReach)) return false
+  return bot.world.raycast(eye, ray.normalize(), distance)?.position.equals(position) ?? false
+}
+
+class CollectGoal extends goals.GoalLookAtBlock {
+  constructor(bot, position) {
+    super(position, bot.world)
+    this.bot = bot
+  }
+
+  isEnd(node) {
+    return hasCollectReach(this.bot, this.pos, node.offset(0.5, 0, 0.5))
+  }
 }
 
 async function until(observe, signal, milliseconds) {
@@ -279,20 +304,14 @@ class MineflayerSession {
         for (let index = 0; index < count; index++) {
           signal.throwIfAborted()
           if (this.#bot.inventory.emptySlotCount() === 0) throw new BlocksideError('INVENTORY_FULL')
-          const position = this.#bot.findBlocks({ point: origin, matching: blockType, maxDistance: radius, count: 32 })
-            .find(position => within(center(position), origin, radius) && !this.#isFooting(position))
-          if (!position) throw new BlocksideError('NO_BLOCK')
-          await this.#collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup })
+          const target = await this.#reachCollectTarget(blockType, { origin, radius, signal })
+          await this.#collectOne(target, itemType, { origin, radius, movements, signal, recordPickup })
         }
       }, { closeOnAbort: true })
     } catch (error) {
       throw new BlocksideError(safeError(error).code, { block, requested: count, collected })
     }
     return { block, requested: count, collected }
-  }
-
-  #isFooting(position) {
-    return this.#bot.entity.position.floored().offset(0, -1, 0).equals(position)
   }
 
   async #navigate(radius, requestSignal, action, { closeOnAbort = false } = {}) {
@@ -331,21 +350,38 @@ class MineflayerSession {
     }
   }
 
-  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup }) {
+  async #reachCollectTarget(blockType, { origin, radius, signal }) {
     const bot = this.#bot
+    const candidates = bot.findBlocks({ point: origin, matching: blockType, maxDistance: radius, count: 32 })
+      .filter(position => within(center(position), origin, radius) && !isFooting(position, bot.entity.position))
+    if (!candidates.length) throw new BlocksideError('NO_BLOCK')
+
+    const goal = new goals.GoalCompositeAny(candidates.map(position => new CollectGoal(bot, position)))
     try {
-      await abortable(bot.pathfinder.goto(new goals.GoalLookAtBlock(position, bot.world)), signal)
+      await abortable(bot.pathfinder.goto(goal), signal)
     } catch (error) {
       signal.throwIfAborted()
       throw safeError(error, 'UNREACHABLE')
     }
     signal.throwIfAborted()
-    const block = bot.blockAt(position)
-    if (block?.type !== blockType || this.#isFooting(position) || !bot.canDigBlock(block)) {
-      throw new BlocksideError('UNREACHABLE')
+    bot.pathfinder.setGoal(null)
+    for (const position of candidates) {
+      const block = this.#collectableBlock(position, blockType)
+      if (block) return block
     }
+    throw new BlocksideError('UNREACHABLE')
+  }
 
-    const pickup = observePickup(bot, position, itemType, origin, radius)
+  #collectableBlock(position, blockType) {
+    const bot = this.#bot
+    const block = bot.blockAt(position)
+    if (block?.type !== blockType || !bot.canDigBlock(block) || !hasCollectReach(bot, position, bot.entity.position)) return
+    return block
+  }
+
+  async #collectOne(block, itemType, { origin, radius, movements, signal, recordPickup }) {
+    const bot = this.#bot
+    const pickup = observePickup(bot, block.position, itemType, origin, radius)
     const work = AbortSignal.any([signal, pickup.signal])
     let operationPending = false
     const waitForOperation = operation => {
@@ -359,7 +395,10 @@ class MineflayerSession {
       // Mineflayer registers its dig cancellation after turning toward the block.
       await waitForOperation(bot.lookAt(center(block.position)))
       work.throwIfAborted()
-      await waitForOperation(bot.dig(block, 'ignore'))
+      const target = this.#collectableBlock(block.position, block.type)
+      if (!target) throw new BlocksideError('UNREACHABLE')
+      if (bot.inventory.emptySlotCount() === 0) throw new BlocksideError('INVENTORY_FULL')
+      await waitForOperation(bot.dig(target, 'ignore'))
       const drop = await until(pickup.ready, work, 1000)
       if (!drop) throw pickup.failure()
       work.throwIfAborted()

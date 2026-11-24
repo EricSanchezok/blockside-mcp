@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { once } from 'node:events'
+import { on, once } from 'node:events'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import minecraftData from 'minecraft-data'
@@ -200,13 +200,14 @@ test('the shipped runner rejects an occluded dig, stops a detour and collects on
   assert.deepEqual(blocked.structuredContent.receipt, { block: 'oak_log', requested: 1, collected: 0 })
 
   const terrainFence = 826_056_318_267n
-  const passageApplied = once(fixture.client, 'keep_alive')
+  const keepAlives = on(fixture.client, 'keep_alive', { signal: t.signal })
   for (const location of obstacles.filter(position => position.z === openingZ)) {
     fixture.client.write('block_change', { location, type: data.blocksByName.air.defaultState })
   }
   fixture.client.write('keep_alive', { keepAliveId: terrainFence })
-  const [reply] = await passageApplied
-  assert.equal(BigInt(reply.keepAliveId), terrainFence)
+  for await (const [{ keepAliveId }] of keepAlives) {
+    if (BigInt(keepAliveId) === terrainFence) break
+  }
 
   const crossed = Promise.withResolvers()
   const observePassage = ({ x, z }) => {

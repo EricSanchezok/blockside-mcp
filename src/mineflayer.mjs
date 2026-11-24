@@ -263,14 +263,31 @@ class MineflayerSession {
     }
   }
 
-  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup }) {
+  async #reach(goal, signal) {
+    signal.throwIfAborted()
     const bot = this.#bot
+    let emptyFailure = false
+    // Source: Mineflayer Pathfinder 2.4.5 resolves goto for empty failed paths.
+    // https://github.com/PrismarineJS/mineflayer-pathfinder/blob/2.4.5/lib/goto.js
+    const checkPath = ({ status, path }) => {
+      if (bot.pathfinder.goal === goal && status !== 'success' && path.length === 0) emptyFailure = true
+    }
+    bot.on('path_update', checkPath)
     try {
-      await abortable(bot.pathfinder.goto(new goals.GoalLookAtBlock(position, bot.world)), signal)
+      await abortable(bot.pathfinder.goto(goal), signal)
     } catch (error) {
       signal.throwIfAborted()
       throw safeError(error, 'UNREACHABLE')
+    } finally {
+      bot.off('path_update', checkPath)
     }
+    signal.throwIfAborted()
+    if (emptyFailure) throw new BlocksideError('UNREACHABLE')
+  }
+
+  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup }) {
+    const bot = this.#bot
+    await this.#reach(new goals.GoalLookAtBlock(position, bot.world), signal)
     signal.throwIfAborted()
     const block = bot.blockAt(position)
     if (block?.type !== blockType || this.#isFooting(position) || !bot.canDigBlock(block)) {

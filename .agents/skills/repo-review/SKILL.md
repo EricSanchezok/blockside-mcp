@@ -28,13 +28,14 @@ Read the diff, the owning docs, the decision log, and enough surrounding code to
 
 ### Project-specific (instantiated at seed time from this project's own rules)
 
-None beyond the universal requirements.
+For game-boundary changes, review endpoint ownership, cancellation, and how the adapter proves pickups against the [prototype contract](../../../docs/specs/0000-local-java-mvp.md).
 
 ## Manual checks
 
 ### Project-specific
 
-None beyond the universal checks.
+- Check the connection lifecycle at both ends of a disconnect, especially while a collection is in flight.
+- Check that tool results and diagnostics contain only the approved fields, including when a dependency fails.
 
 ### Universal fallbacks (apply where the project has no specific rule)
 

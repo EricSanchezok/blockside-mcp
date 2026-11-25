@@ -5,7 +5,29 @@ English is the working language of this repository.
 ## Prerequisites
 
 - Git
-- Node.js 18 or later for the dependency-free governance scripts
+- Node.js 22 or later for the prototype
+
+Install the pinned dependencies with `npm ci --ignore-scripts --no-audit --no-fund`. The tests run against mocks, subprocess stdio, and a loopback fixture. [Testing policy](testing.md)
+
+## Run the development harness
+
+Keep the operator configuration in a private directory outside the checkout or in the ignored `.blockside/` directory. The JSON object contains one private IPv4 target, its port, an authentication mode, and a profile label. This example is for a runner and Minecraft listener on the same host.
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 25565,
+  "auth": "microsoft",
+  "profile": "BlocksideBot"
+}
+```
+
+1. Use the Minecraft loopback listener for a same-host runner. For a runner on a separate trusted host, use the server's private network address. Players use the server's separately approved public game endpoint. A loopback-only listener serves clients on the same host.
+2. For a separately authorized live run, prepare a disposable vanilla Java Edition 1.21.11 world and an allowed non-operator bot account. Keep the launcher player's account separate. The `profile` field is a local cache label. Store only that label in the configuration.
+3. In an interactive terminal on the runner host, run `node src/authorize.mjs /absolute/path/to/runner.json` for Microsoft sign-in. Complete the device prompt in your browser. The command keeps the code on the controlling terminal and creates a private `.blockside-auth/` directory beside the config. Keep the cache and actual game endpoint details local.
+4. Configure a local MCP client to run `node` with the absolute path to `src/main.mjs` and the absolute config path as its two arguments. Call `connect`, check `status`, try a short `follow`, and collect one dirt block in an expendable area. End with `stop` and `disconnect`.
+
+Use `"auth": "offline"` for explicitly configured isolated offline tests. The default test command creates its own loopback target. [Prototype contract](specs/0000-local-java-mvp.md)
 
 ## Daily workflow
 

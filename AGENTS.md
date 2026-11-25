@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Blockside MCP is a planned Model Context Protocol companion for Minecraft.
+Blockside MCP is a Model Context Protocol companion prototype for Minecraft Java Edition.
 
 ## Repository governance
 
@@ -26,7 +26,7 @@ Write code for human readers. Keep the primary logic path visible; introduce an 
 
 ## Commands
 
-Run `node scripts/run-gates.mjs` before every commit.
+Run `npm test` for prototype tests. Run `node scripts/run-gates.mjs` before every commit.
 
 ## Governance loop (hard rules)
 

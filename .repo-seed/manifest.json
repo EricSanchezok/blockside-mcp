@@ -38,7 +38,7 @@
   "files": [
     {
       "path": "AGENTS.md",
-      "sha256": "c870664a32ff8feccfd0e4b711759530fbbe6a5bedec5d2555c796199387491b",
+      "sha256": "c438fc4ee0338fe0019ee3b18016ac4d9a628aa3c9f555aaa7c182d7cf64b14d",
       "category": "instruction",
       "capability": "baseline"
     },
@@ -56,25 +56,25 @@
     },
     {
       "path": "docs/architecture.md",
-      "sha256": "6d42d153ed81c09ccd104aaa9c879f398a821803a923b8ea2774ce5af778f0e5",
+      "sha256": "7f3af1cc322ad61da6aec88bdf4fa04a9240bc57b96a38cfa1d7f778f3dd3c3f",
       "category": "docs",
       "capability": "baseline"
     },
     {
       "path": "docs/development.md",
-      "sha256": "d05088f8eb474cd916fdb54200bcd5ac78d06f3585f07e748b15b2fd43ebdd60",
+      "sha256": "8da0feca27aff1c988f21270eb7febec8e94f3384d9031e2bdb66ad5f6379685",
       "category": "docs",
       "capability": "baseline"
     },
     {
       "path": "docs/testing.md",
-      "sha256": "cb3f9a57d901e5636655ad7539b7bb3855b97e467a189c3acdac8101e5daf8b0",
+      "sha256": "be790c5f5a2e32da1255eb09053482098f4c2d564984638f16d1e084ee5be1e7",
       "category": "docs",
       "capability": "baseline"
     },
     {
       "path": ".agents/skills/repo-review/SKILL.md",
-      "sha256": "cdcb6696ac11ce63e5c4d76d8eff9c69d08f3f6fcc94ee17f681d02b14a31454",
+      "sha256": "e2db58d621dd3a78fb54db19ed532285506508162b273a05fc649ef71e0758ca",
       "category": "skill",
       "capability": "baseline",
       "userModified": true
@@ -183,7 +183,7 @@
     },
     {
       "path": "docs/specs/README.md",
-      "sha256": "8be78a47a00645d9e3ab459901eccaf46d2f6dbc06eb119741c50b4e0b2dea9d",
+      "sha256": "df00eee49c5db733bb8e995fa3ceb7b3602c226823887c04afcf61e2413ff688",
       "category": "docs",
       "capability": "spec"
     },
@@ -195,7 +195,7 @@
     },
     {
       "path": "docs/decisions/README.md",
-      "sha256": "1ecedce32222cc5239a98c01be8271a5231a8d08872cd3c39e7c5ba13e4d12c5",
+      "sha256": "a0a7d04089977af285e6f2779b48d8171147076a4ae9d8d5941acee0b5b51e71",
       "category": "docs",
       "capability": "decisions"
     },

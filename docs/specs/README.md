@@ -44,3 +44,7 @@ Pending until implementation. Implemented specs link permanent repository tests,
 - Implemented specs contain at least one relative repository link in Evidence.
 - Existing external requirements may remain the source of truth; set the Spec capability state to `external`, register the stable source link, and do not create a parallel contract.
 - Keep one spec under roughly 200 lines; split independent contracts rather than growing a design essay.
+
+## Specs
+
+- [0000 Local Java Edition prototype](0000-local-java-mvp.md)

@@ -29,4 +29,4 @@ Run `npm test`. Exercise default denial, isolated opt-in, crafting and gathering
 
 ## Evidence
 
-Pending draft verification.
+[Stdio contract tests](../../tests/mcp.test.mjs), [loopback crafting tests](../../tests/protocol.test.mjs), and [inventory watcher replays](../../tests/crafting-inventory.test.mjs).

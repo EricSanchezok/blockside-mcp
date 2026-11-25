@@ -31,14 +31,40 @@ test('the shipped stdio entry advertises exactly six tools and redacts rejected 
   }
   const needsConnection = await client.callTool({ name: 'follow', arguments: { player: 'Guide', seconds: 1 } })
   assert.equal(needsConnection.structuredContent.code, 'NOT_CONNECTED')
+  const draft = await client.callTool({ name: 'craft', arguments: { item: 'oak_planks', count: 4 } })
+  assert.equal(draft.isError, true)
+  assert.equal(draft.structuredContent.code, 'UNKNOWN_TOOL')
   assert.equal(diagnostics(), '')
 })
 
-test('startup refuses public addresses, hostnames and extra configuration fields', { timeout: 10_000 }, async t => {
+test('isolated stdio opt-in advertises crafting and redacts rejected input', { timeout: 10_000 }, async t => {
+  const { client, diagnostics } = await startStdio(t, { ...offline, draftCraft: true })
+  const { tools } = await client.listTools()
+  assert.deepEqual(tools.map(tool => tool.name).sort(), ['collect', 'connect', 'craft', 'disconnect', 'follow', 'status', 'stop'])
+  const rejectedInputs = [
+    ['craft', { item: 'PRIVATE_MCP_TEST_VALUE', count: 4 }],
+    ['craft', { item: 'oak_planks', count: 13 }],
+    ['craft', { item: 'oak_planks', count: 3 }]
+  ]
+  for (const [name, args] of rejectedInputs) {
+    const result = await client.callTool({ name, arguments: args })
+    assert.equal(result.isError, true)
+    assert.equal(result.structuredContent.code, 'INVALID_INPUT')
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_MCP_TEST_VALUE/)
+  }
+  const needsConnection = await client.callTool({ name: 'craft', arguments: { item: 'oak_planks', count: 4 } })
+  assert.equal(needsConnection.structuredContent.code, 'NOT_CONNECTED')
+  assert.equal(diagnostics(), '')
+})
+
+test('startup validates endpoint and configuration, including draft crafting', { timeout: 10_000 }, async t => {
   for (const config of [
     { ...offline, host: '203.0.113.1' },
     { ...offline, host: 'localhost' },
-    { ...offline, PRIVATE_MCP_TEST_VALUE: 'unused' }
+    { ...offline, PRIVATE_MCP_TEST_VALUE: 'unused' },
+    { ...offline, draftCraft: 'true' },
+    { ...offline, draftCraft: true, host: [10, 0, 0, 1].join('.') },
+    { ...offline, draftCraft: true, auth: 'microsoft' }
   ]) {
     const path = await configFile(t, config)
     await assert.rejects(execute(process.execPath, [runnerEntry, path], { timeout: 3000 }), error => {

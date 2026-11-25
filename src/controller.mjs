@@ -1,5 +1,7 @@
 import { abortable, BlocksideError, safeError } from './errors.mjs'
 
+const inventoryActionTimeout = 20_000
+
 export class GameController {
   #openSession
   #session = null
@@ -52,7 +54,11 @@ export class GameController {
   }
 
   collect(input, requestSignal) {
-    return this.#runAction('collect', input, requestSignal, 20_000)
+    return this.#runAction('collect', input, requestSignal, inventoryActionTimeout)
+  }
+
+  craft(input, requestSignal) {
+    return this.#runAction('craft', input, requestSignal, inventoryActionTimeout)
   }
 
   stop() {

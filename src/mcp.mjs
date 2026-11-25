@@ -3,9 +3,10 @@ import { z } from 'zod'
 import metadata from '../package.json' with { type: 'json' }
 import { playerName } from './config.mjs'
 import { BlocksideError, safeError } from './errors.mjs'
+import { collectibleBlocks, collectCountLimit, collectRadiusLimit, craftableItems, craftCountLimit, planCraft } from './item-actions.mjs'
 
 const empty = z.strictObject({})
-const tools = new Map([
+const toolDefinitions = new Map([
   ['connect', {
     description: 'Connect to the operator-configured Java Edition server.',
     schema: empty,
@@ -24,11 +25,19 @@ const tools = new Map([
   ['collect', {
     description: 'Collect up to three dirt or oak log drops within the specified radius.',
     schema: z.strictObject({
-      block: z.enum(['dirt', 'oak_log']),
-      count: z.number().int().min(1).max(3),
-      radius: z.number().int().min(1).max(8)
+      block: z.enum(collectibleBlocks),
+      count: z.number().int().min(1).max(collectCountLimit),
+      radius: z.number().int().min(1).max(collectRadiusLimit)
     }),
     run: (game, input, signal) => game.collect(input, signal)
+  }],
+  ['craft', {
+    description: 'Craft an approved item from stock in the player inventory. For four oak planks, use item oak_planks and count 4. Request whole recipe outputs and check inventory after an incomplete craft.',
+    schema: z.strictObject({
+      item: z.enum(craftableItems),
+      count: z.number().int().min(1).max(craftCountLimit)
+    }).refine(({ item, count }) => planCraft(item, count) !== null),
+    run: (game, input, signal) => game.craft(input, signal)
   }],
   ['stop', {
     description: 'Stop the active game action. An in-progress dig may require disconnecting.',
@@ -50,7 +59,9 @@ function result(data, isError = false) {
   }
 }
 
-export function createMcpServer(game) {
+export function createMcpServer(game, { draftCraft = false } = {}) {
+  const tools = new Map(toolDefinitions)
+  if (draftCraft !== true) tools.delete('craft')
   const server = new Server({ name: metadata.name, version: metadata.version }, { capabilities: { tools: {} } })
   server.setRequestHandler('tools/list', () => ({
     tools: [...tools].map(([name, { description, schema }]) => ({

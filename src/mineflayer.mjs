@@ -5,7 +5,9 @@ import pathfinderPlugin from 'mineflayer-pathfinder'
 import collectblock from 'mineflayer-collectblock'
 import { microsoftOptions } from './auth.mjs'
 import { checkAuthCache, javaVersion } from './config.mjs'
+import { watchCraftingInventory } from './crafting-inventory.mjs'
 import { abortable, BlocksideError, safeError } from './errors.mjs'
+import { planCraft } from './item-actions.mjs'
 
 const { Movements, goals, pathfinder } = pathfinderPlugin
 const followRadius = 16
@@ -18,6 +20,59 @@ function center(position) {
 
 function within(position, origin, radius) {
   return position?.distanceTo(origin) <= radius
+}
+
+function craftingGridClear(inventory) {
+  return !inventory.selectedItem && inventory.slots.slice(0, 5).every(item => item == null)
+}
+
+function inventoryStateAfter(stateId, previousStateId) {
+  if (!Number.isInteger(stateId) || stateId < 0 || stateId > 0x7fff) return false
+  if (previousStateId === undefined) return true
+  // Container revisions wrap after 32767 on the Java server.
+  const advance = (stateId - previousStateId) & 0x7fff
+  return advance > 0 && advance < 0x4000
+}
+
+async function syncCraftingInventory(bot, signal, afterStateId, expectedBatch, inventoryProof) {
+  const { inventory, _client: client } = bot
+  const slots = inventory.slots.length
+  const authoritative = Promise.withResolvers()
+  let latestStateId = afterStateId
+  let ticket
+  const observe = packet => {
+    if (packet.windowId !== inventory.id || bot.currentWindow || bot.inventory !== inventory ||
+        !inventoryStateAfter(packet.stateId, latestStateId)) return
+    latestStateId = packet.stateId
+    if (packet.items.length !== slots || packet.carriedItem === undefined) {
+      authoritative.reject(new BlocksideError('CRAFT_UNCONFIRMED'))
+      return
+    }
+    const snapshotTicket = inventoryProof.ticketFor(packet)
+    if (snapshotTicket === null) return
+    // Paper sends full snapshots before the result reaches the player's inventory.
+    // A clear grid and unchanged counts are insufficient to confirm the current batch.
+    if (!craftingGridClear(inventory)) return
+    const input = inventory.count(expectedBatch.inputType)
+    const output = inventory.count(expectedBatch.outputType)
+    if (input === expectedBatch.inputCount && output === expectedBatch.outputCount) {
+      ticket = snapshotTicket
+      authoritative.resolve({ input, output })
+    }
+  }
+  client.on('window_items', observe)
+  try {
+    // Mineflayer requests a full snapshot, but its waiter accepts the first window packet.
+    // Source: https://github.com/PrismarineJS/mineflayer/blob/4.39.0/lib/plugins/inventory.js
+    const [snapshot] = await abortable(Promise.all([
+      authoritative.promise,
+      bot._syncWindow(inventory)
+    ]), signal)
+    signal.throwIfAborted()
+    return { snapshot, ticket }
+  } finally {
+    client.off('window_items', observe)
+  }
 }
 
 async function until(observe, signal, milliseconds) {
@@ -68,6 +123,7 @@ export function mineflayerFactory(config) {
 
 class MineflayerSession {
   #bot
+  #craftingInventory
   #socket
   #closed = false
   #spawned = false
@@ -105,6 +161,7 @@ class MineflayerSession {
       })
       this.#bot.loadPlugin(pathfinder)
       this.#bot.loadPlugin(collectblock.plugin)
+      if (config.draftCraft) this.#craftingInventory = watchCraftingInventory(this.#bot)
     } catch (error) {
       this.#socket?.destroy()
       throw error
@@ -221,6 +278,98 @@ class MineflayerSession {
       throw new BlocksideError(safeError(error).code, { block, requested: count, collected })
     }
     return { block, requested: count, collected }
+  }
+
+  async craft({ item, count }, signal) {
+    signal.throwIfAborted()
+    const plan = planCraft(item, count)
+    if (!plan) throw new BlocksideError('INVALID_INPUT')
+    const { ingredient, inputPerBatch, outputPerBatch, batches } = plan
+    const bot = this.#bot
+    const { inventory, registry } = bot
+    const input = registry.itemsByName[ingredient]
+    const output = registry.itemsByName[item]
+    if (!input || !output || count > output.stackSize || bot.currentWindow || !bot.supportFeature('stateIdUsed')) {
+      throw new BlocksideError('CRAFT_UNAVAILABLE')
+    }
+
+    const matchesRecipe = recipe => !recipe.requiresTable && !recipe.outShape &&
+      recipe.result.id === output.id && recipe.result.count === outputPerBatch &&
+      recipe.delta.length === 2 &&
+      recipe.delta.some(delta => delta.id === input.id && delta.metadata == null && delta.count === -inputPerBatch) &&
+      recipe.delta.some(delta => delta.id === output.id && delta.metadata == null && delta.count === outputPerBatch)
+    if (!bot.recipesAll(output.id, null, null).some(matchesRecipe)) throw new BlocksideError('CRAFT_UNAVAILABLE')
+
+    const client = bot._client
+    const closeOnContainer = () => this.close()
+    let crafted = 0
+    let batchPending = false
+    let windowStateId
+    const rememberPlayerWindowState = ({ windowId, stateId }) => {
+      if (windowId === inventory.id && !bot.currentWindow && inventoryStateAfter(stateId, windowStateId)) {
+        windowStateId = stateId
+      }
+    }
+    client.on('window_items', rememberPlayerWindowState)
+    client.on('set_slot', rememberPlayerWindowState)
+    // Mineflayer changes currentWindow on these packets, before it emits windowOpen.
+    client.prependListener('open_window', closeOnContainer)
+    client.prependListener('open_horse_window', closeOnContainer)
+    try {
+      let ticket = await this.#craftingInventory.sync(signal)
+      signal.throwIfAborted()
+      if (!craftingGridClear(inventory)) throw new BlocksideError('CRAFT_UNAVAILABLE')
+      const required = inputPerBatch * batches
+      signal.throwIfAborted()
+      let beforeInput = inventory.count(input.id)
+      let beforeOutput = inventory.count(output.id)
+      if (beforeInput < required) throw new BlocksideError('MISSING_INGREDIENTS')
+      if (inventory.emptySlotCount() === 0) throw new BlocksideError('INVENTORY_FULL')
+      const recipe = bot.recipesFor(output.id, null, count, null).find(matchesRecipe)
+      if (!recipe || !craftingGridClear(inventory)) throw new BlocksideError('CRAFT_UNAVAILABLE')
+
+      for (let batch = 0; batch < batches; batch++) {
+        signal.throwIfAborted()
+        batchPending = true
+        let confirmed
+        try {
+          await this.#craftingInventory.craftBatch(recipe, signal, ticket)
+          signal.throwIfAborted()
+          const proof = await syncCraftingInventory(bot, signal, windowStateId, {
+            inputType: input.id,
+            outputType: output.id,
+            inputCount: beforeInput - inputPerBatch,
+            outputCount: beforeOutput + outputPerBatch
+          }, this.#craftingInventory)
+          signal.throwIfAborted()
+          confirmed = proof.snapshot
+          ticket = proof.ticket
+        } catch (error) {
+          signal.throwIfAborted()
+          this.close()
+          throw safeError(error, 'CRAFT_UNCONFIRMED')
+        }
+
+        const { input: afterInput, output: afterOutput } = confirmed
+        if (!craftingGridClear(inventory)) throw new BlocksideError('CRAFT_UNCONFIRMED')
+
+        crafted += outputPerBatch
+        batchPending = false
+        beforeInput = afterInput
+        beforeOutput = afterOutput
+      }
+      return { item, requested: count, crafted }
+    } catch (error) {
+      if (crafted === 0) throw error
+      throw new BlocksideError(safeError(error).code, {
+        item, requested: count, crafted, remaining: batchPending ? null : count - crafted
+      })
+    } finally {
+      client.off('window_items', rememberPlayerWindowState)
+      client.off('set_slot', rememberPlayerWindowState)
+      client.off('open_window', closeOnContainer)
+      client.off('open_horse_window', closeOnContainer)
+    }
   }
 
   #isFooting(position) {

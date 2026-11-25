@@ -20,8 +20,9 @@ const configSchema = z.strictObject({
   host: z.string().refine(isLocalAddress),
   port: z.number().int().min(1).max(65535),
   auth: z.enum(['offline', 'microsoft']),
-  profile: playerName
-})
+  profile: playerName,
+  draftCraft: z.boolean().default(false)
+}).refine(config => !config.draftCraft || (config.auth === 'offline' && config.host.startsWith('127.')))
 
 export async function loadConfig(args) {
   try {

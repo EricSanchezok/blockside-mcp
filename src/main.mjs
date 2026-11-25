@@ -26,7 +26,7 @@ try {
   const { createMcpServer } = await import('./mcp.mjs')
   const { serveStdio, StdioServerTransport } = await import('@modelcontextprotocol/server/stdio')
   game = new GameController(mineflayerFactory(config))
-  handle = serveStdio(() => createMcpServer(game), {
+  handle = serveStdio(() => createMcpServer(game, { draftCraft: config.draftCraft }), {
     transport: new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: 32_768 })
   })
   process.stdin.once('end', () => void close())

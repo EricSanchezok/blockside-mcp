@@ -32,7 +32,7 @@ const toolDefinitions = new Map([
     run: (game, input, signal) => game.collect(input, signal)
   }],
   ['craft', {
-    description: 'Craft an approved item from stock in the player inventory. For four oak planks, use item oak_planks and count 4. Request whole recipe outputs and check inventory after an incomplete craft.',
+    description: 'Craft an approved item in the player inventory and gather any missing approved ingredients within eight blocks. For four oak planks, use item oak_planks and count 4. Request whole recipe outputs and check inventory after an incomplete craft.',
     schema: z.strictObject({
       item: z.enum(craftableItems),
       count: z.number().int().min(1).max(craftCountLimit)

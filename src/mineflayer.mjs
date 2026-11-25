@@ -7,12 +7,13 @@ import { microsoftOptions } from './auth.mjs'
 import { checkAuthCache, javaVersion } from './config.mjs'
 import { watchCraftingInventory } from './crafting-inventory.mjs'
 import { abortable, BlocksideError, safeError } from './errors.mjs'
-import { planCraft } from './item-actions.mjs'
+import { collectibleBlocks, collectCountLimit, collectRadiusLimit, planCraft } from './item-actions.mjs'
 
 const { Movements, goals, pathfinder } = pathfinderPlugin
 const followRadius = 16
 const transientErrors = new Set(['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE'])
 const airBlocks = new Set(['air', 'cave_air', 'void_air'])
+const pickupInventoryPackets = ['set_player_inventory', 'set_slot', 'window_items']
 
 function center(position) {
   return position.offset(0.5, 0.5, 0.5)
@@ -260,7 +261,9 @@ class MineflayerSession {
 
   async collect({ block, count, radius }, requestSignal) {
     let collected = 0
+    let observedAcquired = 0
     const recordPickup = () => { collected++ }
+    const recordAcquisition = () => { observedAcquired++ }
     try {
       await this.#navigate(radius, requestSignal, async ({ origin, movements, signal }) => {
         const blockType = this.#bot.registry.blocksByName[block].id
@@ -271,11 +274,15 @@ class MineflayerSession {
           const position = this.#bot.findBlocks({ point: origin, matching: blockType, maxDistance: radius, count: 32 })
             .find(position => within(center(position), origin, radius) && !this.#isFooting(position))
           if (!position) throw new BlocksideError('NO_BLOCK')
-          await this.#collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup })
+          await this.#collectOne(position, blockType, itemType, {
+            origin, radius, movements, signal, recordPickup, recordAcquisition
+          })
         }
       }, { closeOnAbort: true })
     } catch (error) {
-      throw new BlocksideError(safeError(error).code, { block, requested: count, collected })
+      const receipt = { block, requested: count, collected }
+      if (this.#craftingInventory && observedAcquired) receipt.observedAcquired = observedAcquired
+      throw new BlocksideError(safeError(error).code, receipt)
     }
     return { block, requested: count, collected }
   }
@@ -304,6 +311,7 @@ class MineflayerSession {
     const closeOnContainer = () => this.close()
     let crafted = 0
     let batchPending = false
+    let ingredients
     let windowStateId
     const rememberPlayerWindowState = ({ windowId, stateId }) => {
       if (windowId === inventory.id && !bot.currentWindow && inventoryStateAfter(stateId, windowStateId)) {
@@ -320,6 +328,27 @@ class MineflayerSession {
       signal.throwIfAborted()
       if (!craftingGridClear(inventory)) throw new BlocksideError('CRAFT_UNAVAILABLE')
       const required = inputPerBatch * batches
+      const missing = required - inventory.count(input.id)
+      if (missing > 0) {
+        if (missing > collectCountLimit || !collectibleBlocks.includes(ingredient)) {
+          throw new BlocksideError('MISSING_INGREDIENTS')
+        }
+        let acquisition
+        try {
+          await this.collect({ block: ingredient, count: missing, radius: collectRadiusLimit }, signal)
+        } catch (error) {
+          const receipt = error instanceof BlocksideError && error.code === 'NO_PICKUP' ? error.receipt : null
+          if (!receipt?.observedAcquired || receipt.collected + receipt.observedAcquired !== missing) throw error
+          acquisition = error
+        }
+        ticket = await this.#craftingInventory.sync(signal)
+        signal.throwIfAborted()
+        if (acquisition) {
+          if (inventory.count(input.id) !== required) throw acquisition
+          ingredients = acquisition.receipt
+        }
+      }
+
       signal.throwIfAborted()
       let beforeInput = inventory.count(input.id)
       let beforeOutput = inventory.count(output.id)
@@ -358,11 +387,12 @@ class MineflayerSession {
         beforeInput = afterInput
         beforeOutput = afterOutput
       }
-      return { item, requested: count, crafted }
+      return { item, requested: count, crafted, ...(ingredients ? { ingredients } : {}) }
     } catch (error) {
-      if (crafted === 0) throw error
+      if (crafted === 0 && !ingredients) throw error
       throw new BlocksideError(safeError(error).code, {
-        item, requested: count, crafted, remaining: batchPending ? null : count - crafted
+        item, requested: count, crafted, remaining: batchPending ? null : count - crafted,
+        ...(ingredients ? { ingredients } : {})
       })
     } finally {
       client.off('window_items', rememberPlayerWindowState)
@@ -434,7 +464,7 @@ class MineflayerSession {
     if (emptyFailure) throw new BlocksideError('UNREACHABLE')
   }
 
-  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup }) {
+  async #collectOne(position, blockType, itemType, { origin, radius, movements, signal, recordPickup, recordAcquisition }) {
     const bot = this.#bot
     await this.#reach(new goals.GoalLookAtBlock(position, bot.world), signal)
     signal.throwIfAborted()
@@ -444,28 +474,66 @@ class MineflayerSession {
     }
 
     const removal = observeRemoval(bot, position)
-    const spawned = new Set()
+    const spawned = new Map()
     const drops = new Set()
-    const before = bot.inventory.count(itemType)
+    const earlyDrops = new Set()
+    const { inventory, _client: client } = bot
+    const before = inventory.count(itemType)
+    const inventorySize = inventory.slots.length
     const blockCenter = center(position)
     let pickedUp = false
+    let digFinished = false
+    let ownPickups = 0
+    let earlyPickup = false
+    let matchingGain = false
+    let stockConflict = false
+    let lastStock = before
     const nearTarget = entity => within(entity.position, blockCenter, 0.75) && within(entity.position, origin, radius)
+    const onDigFinished = block => {
+      if (block.position.equals(position)) digFinished = true
+    }
     const onSpawn = entity => {
-      if (removal.confirmed && entity.name === 'item' && nearTarget(entity)) spawned.add(entity)
+      if (entity.name === 'item' && nearTarget(entity) && (removal.confirmed || digFinished)) {
+        spawned.set(entity, removal.confirmed)
+      }
     }
     const onDrop = entity => {
-      // Item metadata can arrive after the removal for an entity that spawned earlier.
-      if (spawned.has(entity) && nearTarget(entity) && entity.getDroppedItem()?.type === itemType) drops.add(entity)
+      if (!spawned.has(entity) || !nearTarget(entity) || entity.getDroppedItem()?.type !== itemType) return
+      const matching = spawned.get(entity) ? drops : earlyDrops
+      matching.add(entity)
     }
-    const onPickup = (collector, entity) => {
-      if (collector.id === bot.entity.id && drops.has(entity)) pickedUp = true
+    const onPickup = ({ collectorEntityId, collectedEntityId, pickupItemCount }) => {
+      if (collectorEntityId !== bot.entity.id) return
+      const entity = bot.entities[collectedEntityId]
+      ownPickups++
+      if (drops.has(entity)) pickedUp = true
+      if (ownPickups === 1 && pickupItemCount === 1 && removal.confirmed &&
+          earlyDrops.has(entity) && inventory.count(itemType) === before) earlyPickup = true
     }
-    const hasConfirmedPickup = () => pickedUp && bot.inventory.count(itemType) > before
+    const onInventory = packet => {
+      if (packet.windowId !== undefined && packet.windowId !== inventory.id) return
+      if (packet.items && packet.items.length !== inventorySize) stockConflict = true
+      const stock = inventory.count(itemType)
+      if (stock === lastStock) return
+      if (earlyPickup && !matchingGain && stock === before + 1) matchingGain = true
+      else stockConflict = true
+      lastStock = stock
+    }
+    const hasConfirmedPickup = () => pickedUp && inventory.count(itemType) > before
+    const hasObservedAcquisition = () => earlyDrops.size === 1 && drops.size === 0 && ownPickups === 1 &&
+      matchingGain && !stockConflict && inventory.count(itemType) === before + 1
     let confirmedAtCancel = false
-    const onAbort = () => { confirmedAtCancel = hasConfirmedPickup() }
+    let observedAtCancel = false
+    const onAbort = () => {
+      confirmedAtCancel = hasConfirmedPickup()
+      observedAtCancel = hasObservedAcquisition()
+    }
+    bot.on('diggingCompleted', onDigFinished)
     bot.on('entitySpawn', onSpawn)
     bot.on('itemDrop', onDrop)
-    bot.on('playerCollect', onPickup)
+    // Read the live object and quantity before Mineflayer dispatches the pickup.
+    client.prependListener('collect', onPickup)
+    for (const packet of pickupInventoryPackets) client.on(packet, onInventory)
     signal.addEventListener('abort', onAbort, { once: true })
     try {
       // Navigate with digging disabled. Only this explicit call breaks a block.
@@ -489,10 +557,13 @@ class MineflayerSession {
     } finally {
       signal.removeEventListener('abort', onAbort)
       removal.detach()
+      bot.off('diggingCompleted', onDigFinished)
       bot.off('entitySpawn', onSpawn)
       bot.off('itemDrop', onDrop)
-      bot.off('playerCollect', onPickup)
+      client.off('collect', onPickup)
+      for (const packet of pickupInventoryPackets) client.off(packet, onInventory)
       if (signal.aborted ? confirmedAtCancel : hasConfirmedPickup()) recordPickup()
+      else if (signal.aborted ? observedAtCancel : hasObservedAcquisition()) recordAcquisition()
     }
   }
 }
